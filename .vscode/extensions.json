@@ -1,0 +1,15 @@
+{
+  "recommendations": [
+    // Official Swift support: build, test, diagnostics, SourceKit-LSP.
+    // Required for code completion in this project.
+    "swiftlang.swift-vscode",
+
+    // iOS development from VS Code: drives xcodebuild, manages simulators,
+    // and handles app debugging. macOS only, and the practical way to run the
+    // app without opening Xcode.
+    "sweetpad.sweetpad",
+
+    // Debugger used by the "Debug core tests" launch configuration.
+    "vadimcn.vscode-lldb"
+  ]
+}

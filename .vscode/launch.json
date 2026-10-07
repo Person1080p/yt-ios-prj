@@ -1,0 +1,52 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Debugs the SwiftPM test bundle for the portable source layer — the
+      // queue, the matcher and the source adapters.
+      //
+      // Requires vadimcn.vscode-lldb. "Build core logic" runs first.
+      //
+      // The platform blocks matter: on Linux SwiftPM links the bundle as a
+      // plain executable, while on macOS it is a bundle directory that has to
+      // be run through the xctest harness.
+      "name": "Debug core tests",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "Build core logic",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/.build/debug/AuraPackageTests.xctest",
+      "args": [],
+      "linux": {
+        "program": "${workspaceFolder}/.build/debug/AuraPackageTests.xctest"
+      },
+      "osx": {
+        "program": "/usr/bin/xcrun",
+        "args": ["xctest", "${workspaceFolder}/.build/debug/AuraPackageTests.xctest"]
+      }
+    },
+
+    {
+      // Runs one test case. Edit the filter to match what you're working on.
+      "name": "Debug one test case",
+      "type": "lldb",
+      "request": "launch",
+      "preLaunchTask": "Build core logic",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/.build/debug/AuraPackageTests.xctest",
+      "args": ["AuraTests.TrackMatcherTests"],
+      "osx": {
+        "program": "/usr/bin/xcrun",
+        "args": [
+          "xctest",
+          "-XCTest", "AuraTests.TrackMatcherTests",
+          "${workspaceFolder}/.build/debug/AuraPackageTests.xctest"
+        ]
+      }
+    }
+  ]
+
+  // Debugging the iOS app itself needs a simulator or device session, which
+  // plain VS Code cannot provide. Use the SweetPad extension (macOS), or open
+  // the generated project in Xcode with `make open`.
+}

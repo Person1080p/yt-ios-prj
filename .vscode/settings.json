@@ -1,0 +1,48 @@
+{
+  // ---------------------------------------------------------------- Swift
+  // The SwiftPM harness at the repo root covers the portable source layer.
+  // SourceKit-LSP indexes that; files importing UIKit/AVFoundation/CarPlay
+  // will show import errors here and are expected to — they only resolve
+  // against the iOS SDK in Xcode.
+  "swift.autoGenerateLaunchConfigurations": false,
+  "swift.disableAutoResolve": false,
+
+  // ------------------------------------------------------------- Editor
+  "[swift]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.rulers": [100],
+    "editor.formatOnSave": false
+  },
+
+  "files.associations": {
+    "project.yml": "yaml",
+    "*.entitlements": "xml",
+    "Info.plist": "xml"
+  },
+
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+
+  // --------------------------------------------------------------- Noise
+  "files.exclude": {
+    "**/.build": true,
+    "**/build": true,
+    "**/DerivedData": true,
+    "**/*.xcodeproj": true,
+    "**/.DS_Store": true
+  },
+
+  "search.exclude": {
+    "**/.build": true,
+    "**/build": true,
+    "**/DerivedData": true,
+    "**/Package.resolved": true
+  },
+
+  "files.watcherExclude": {
+    "**/.build/**": true,
+    "**/build/**": true,
+    "**/DerivedData/**": true
+  }
+}

@@ -1,0 +1,134 @@
+{
+  "version": "2.0.0",
+
+  // Swift diagnostics matcher, defined here so the tasks work without
+  // depending on a matcher contributed by an extension.
+  "problemMatcher": [],
+
+  "tasks": [
+    {
+      "label": "Test core logic",
+      "detail": "Runs the unit suite over the portable source layer. Works on any OS.",
+      "type": "shell",
+      "command": "swift test",
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "swift",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning|note):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+
+    {
+      "label": "Build core logic",
+      "detail": "Type-checks the portable source layer. Works on any OS.",
+      "type": "shell",
+      "command": "swift build",
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "swift",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning|note):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+
+    {
+      "label": "Watch core tests",
+      "detail": "Re-runs the suite whenever a Swift file changes. Needs 'entr' (brew/apt install entr).",
+      "type": "shell",
+      "command": "find Core Tests Support -name '*.swift' | entr -c swift test",
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Generate Xcode project",
+      "detail": "macOS only. Runs XcodeGen over project.yml.",
+      "type": "shell",
+      "command": "make project",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Generate Xcode project (no CarPlay entitlement)",
+      "detail": "macOS only. Use while the CarPlay entitlement is unapproved, since signing fails with it declared.",
+      "type": "shell",
+      "command": "make no-carplay",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Build app (simulator)",
+      "detail": "macOS only. Override the device with the SIM variable in the Makefile.",
+      "type": "shell",
+      "command": "make build",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "swift",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^(.*?):(\\d+):(\\d+):\\s+(error|warning|note):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      }
+    },
+
+    {
+      "label": "Test app (simulator)",
+      "detail": "macOS only. Runs the XCTest bundle on a simulator.",
+      "type": "shell",
+      "command": "make test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Open in Xcode",
+      "detail": "macOS only. Generates the project and opens it.",
+      "type": "shell",
+      "command": "make open",
+      "presentation": { "reveal": "silent", "panel": "shared" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "List simulators",
+      "detail": "macOS only. Shows device names usable as SIM.",
+      "type": "shell",
+      "command": "make simulators",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": []
+    },
+
+    {
+      "label": "Clean",
+      "type": "shell",
+      "command": "make clean",
+      "presentation": { "reveal": "silent", "panel": "shared" },
+      "problemMatcher": []
+    }
+  ]
+}
