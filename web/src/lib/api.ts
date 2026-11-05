@@ -34,7 +34,7 @@ export type LikedEntry = {
   title: string;
   artist: string;
   album?: string | null;
-  status: "matched" | "unmatched";
+  status: "matched" | "unmatched" | "error" | "manual";
   track?: Track | null;
 };
 
@@ -54,7 +54,15 @@ export type HistoryEntry = { playedAt: number; source: string; scrobbled: boolea
 
 export type ProfileInfo = { active: "main" | "fresh"; freshPlays: number; freshStartedAt?: number | null };
 
-export type Prefs = { preferPlex: boolean; scrobble: boolean; reportYoutube: boolean };
+export type Prefs = {
+  preferPlex: boolean;
+  scrobble: boolean;
+  reportYoutube: boolean;
+  loveOnLastfm: boolean;
+  syncLastfmLoves: boolean;
+};
+
+export type LikedState = { inLibrary: boolean; lastfmLoved?: boolean | null; liked: boolean };
 
 export type TailscaleInfo = {
   mode: "embedded" | "host" | "none" | "";
@@ -124,14 +132,16 @@ async function req<T>(
 const enc = encodeURIComponent;
 
 export const api = {
-  home: () => req<{ shelves: Shelf[] }>("/home"),
+  home: (refresh = false) => req<{ shelves: Shelf[] }>(`/home${refresh ? "?refresh=1" : ""}`),
   discover: () => req<{ shelves: Shelf[] }>("/discover"),
   search: (q: string, signal?: AbortSignal) => req<Track[]>(`/search?q=${enc(q)}`, { signal }),
   radio: (videoId: string) => req<Track[]>(`/radio/${enc(videoId)}`),
   playlist: (id: string) => req<Track[]>(`/playlist/${enc(id)}`),
   recommendations: (videoId: string) => req<Track[]>(`/recommendations/${enc(videoId)}`),
   source: (videoId: string) => req<{ source: "plex" | "youtube" }>(`/tracks/${enc(videoId)}/source`),
-  love: (videoId: string) => req<{ ok: boolean }>(`/tracks/${enc(videoId)}/love`, { method: "POST" }),
+  liked: (videoId: string) => req<LikedState>(`/tracks/${enc(videoId)}/liked`),
+  setLiked: (track: Track, liked: boolean) =>
+    req<LikedState>(`/tracks/${enc(track.videoId)}/liked`, { method: "PUT", body: { track, liked } }),
   history: () => req<HistoryEntry[]>("/history"),
   playback: (ev: {
     sessionId: string;
@@ -170,6 +180,12 @@ export const api = {
       return req<LikedEntry[]>(`/library/liked?${qs}`);
     },
     jobs: () => req<ImportJob[]>("/import/jobs"),
+    ids: () => req<string[]>("/library/ids"),
+    add: (track: Track) => req<{ ok: boolean }>("/library/liked", { body: { track } }),
+    remove: (id: number) => req<{ ok: boolean }>(`/library/liked/${id}`, { method: "DELETE" }),
+    match: (id: number, track: Track) => req<{ ok: boolean }>(`/library/liked/${id}/match`, { body: { track } }),
+    rematch: () => req<{ jobId: number }>("/library/rematch", { method: "POST" }),
+    importLastfm: () => req<{ jobId: number }>("/import/lastfm", { method: "POST" }),
     importYtMusic: () => req<{ jobId: number }>("/import/ytmusic", { method: "POST" }),
     importSpotify: () => req<{ jobId: number }>("/import/spotify", { method: "POST" }),
     spotifyLogin: (redirect: string) => req<{ url: string }>(`/import/spotify/login?redirect=${enc(redirect)}`),

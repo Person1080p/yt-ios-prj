@@ -60,6 +60,8 @@ async fn main() -> anyhow::Result<()> {
     }
     playback::spawn_retry_loop(state.clone());
     services::ytauth::spawn_sync_loop(state.clone());
+    services::importers::spawn_lastfm_sync(state.clone());
+    services::cache::spawn_purge_loop(state.db.clone());
 
     let app = routes::router(state.clone());
 

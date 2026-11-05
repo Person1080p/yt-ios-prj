@@ -17,7 +17,7 @@ pub struct Track {
     pub thumbnail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HomeItem {
     /// song | video | playlist | album | artist
@@ -32,7 +32,7 @@ pub struct HomeItem {
     pub track: Option<Track>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Shelf {
     pub title: String,

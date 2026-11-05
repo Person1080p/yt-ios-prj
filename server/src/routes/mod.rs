@@ -1,3 +1,4 @@
+pub mod art;
 pub mod library;
 pub mod music;
 pub mod playlists;
@@ -42,7 +43,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/recommendations/{video_id}", get(music::recommendations))
         .route("/tracks/{video_id}", get(music::track))
         .route("/tracks/{video_id}/source", get(stream::source))
-        .route("/tracks/{video_id}/love", post(music::love))
         .route("/stream/{video_id}", get(stream::stream))
         .route("/history", get(music::history))
         .route("/playback", post(settings::playback_event))
@@ -61,7 +61,14 @@ pub fn router(state: SharedState) -> Router {
         .route("/playlists", get(playlists::list).post(playlists::create))
         .route("/playlists/{id}", get(playlists::get).put(playlists::update).delete(playlists::delete))
         // library + imports
-        .route("/library/liked", get(library::liked))
+        .route("/library/liked", get(library::liked).post(library::add))
+        .route("/library/liked/{id}", delete(library::remove))
+        .route("/library/liked/{id}/match", post(library::set_match))
+        .route("/library/ids", get(library::liked_ids))
+        .route("/library/rematch", post(library::rematch))
+        .route("/import/lastfm", post(library::import_lastfm))
+        .route("/tracks/{video_id}/liked", get(library::get_liked).put(library::set_liked))
+        .route("/art", get(art::art))
         .route("/import/jobs", get(library::jobs))
         .route("/import/ytmusic", post(library::import_ytmusic))
         .route("/import/spotify", post(library::import_spotify))

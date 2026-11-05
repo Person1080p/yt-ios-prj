@@ -274,3 +274,11 @@ textarea.input { resize: vertical; margin: 8px 0; font-family: ui-monospace, mon
 .home-head { margin-bottom: 8px; }
 .fresh-note { background: rgba(255, 77, 109, 0.1); border: 1px solid rgba(255, 77, 109, 0.3); border-radius: 10px; padding: 10px 12px; margin: 0 0 18px; }
 @media (min-width: 761px) { .home-head .profile-toggle { display: none; } }
+
+.icon-btn.heart.on { color: var(--accent); }
+.player-bar-controls > span { display: inline-flex; }
+
+.track-row.unmatched .track-title { opacity: 0.65; }
+.match-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 10px; }
+.match-row.current { background: var(--bg-3); }
+.match-row .btn { flex-shrink: 0; }

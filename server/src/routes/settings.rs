@@ -105,6 +105,10 @@ pub struct Prefs {
     prefer_plex: bool,
     scrobble: bool,
     report_youtube: bool,
+    #[serde(default = "yes")]
+    love_on_lastfm: bool,
+    #[serde(default)]
+    sync_lastfm_loves: bool,
 }
 
 async fn load_prefs(st: &SharedState) -> Prefs {
@@ -112,6 +116,8 @@ async fn load_prefs(st: &SharedState) -> Prefs {
         prefer_plex: st.db.get_bool("prefs.prefer_plex", true).await,
         scrobble: st.db.get_bool("prefs.scrobble", true).await,
         report_youtube: st.db.get_bool("prefs.report_youtube", true).await,
+        love_on_lastfm: st.db.get_bool("prefs.love_on_lastfm", true).await,
+        sync_lastfm_loves: st.db.get_bool(crate::services::importers::LASTFM_SYNC_PREF, false).await,
     }
 }
 
@@ -119,6 +125,10 @@ pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> A
     st.db.set_setting("prefs.prefer_plex", if p.prefer_plex { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.scrobble", if p.scrobble { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.report_youtube", if p.report_youtube { "1" } else { "0" }).await?;
+    st.db.set_setting("prefs.love_on_lastfm", if p.love_on_lastfm { "1" } else { "0" }).await?;
+    st.db
+        .set_setting(crate::services::importers::LASTFM_SYNC_PREF, if p.sync_lastfm_loves { "1" } else { "0" })
+        .await?;
     Ok(Json(load_prefs(&st).await))
 }
 

@@ -19,8 +19,14 @@ pub struct HomeResponse {
     pub shelves: Vec<Shelf>,
 }
 
-pub async fn home(State(st): State<SharedState>) -> ApiResult<HomeResponse> {
-    let shelves = st.yt.home().await?;
+#[derive(Deserialize)]
+pub struct RefreshQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+pub async fn home(State(st): State<SharedState>, Query(q): Query<RefreshQuery>) -> ApiResult<HomeResponse> {
+    let shelves = st.yt.home(q.refresh.is_some()).await?;
     let tracks: Vec<Track> = shelves.iter().flat_map(|s| s.items.iter().filter_map(|i| i.track.clone())).collect();
     st.db.upsert_tracks(tracks).await?;
     Ok(Json(HomeResponse { shelves }))
@@ -127,10 +133,4 @@ pub async fn history(State(st): State<SharedState>) -> ApiResult<Vec<HistoryEntr
         })
         .await?;
     Ok(Json(rows))
-}
-
-pub async fn love(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<serde_json::Value> {
-    let t = track_or_fetch(&st, &video_id).await?;
-    st.lastfm.love(&t).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
 }

@@ -3,6 +3,7 @@ import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { api } from "./lib/api";
 import { initPlayer } from "./lib/player";
 import { loadProfile, useProfile } from "./lib/profile";
+import { loadLibraryIds } from "./lib/library";
 import ProfileToggle from "./components/ProfileToggle";
 import { useTailnet } from "./lib/tailnet";
 import { setToken as saveToken, useConnection, useTransportReady, watchConnection } from "./lib/transport";
@@ -115,6 +116,7 @@ export default function App() {
     if (online) {
       initPlayer();
       loadProfile();
+      loadLibraryIds();
     }
   }, [online]);
 

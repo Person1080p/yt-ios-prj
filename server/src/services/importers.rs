@@ -73,6 +73,8 @@ where
             })
             .await?;
 
+        // "error" = the lookup itself failed (e.g. rate limited) — retried by "Retry unmatched".
+        let mut status = "unmatched";
         let video_id = match (it.video_id.clone(), existing) {
             (Some(v), _) => {
                 ensure_track(state, &v, &it).await;
@@ -81,16 +83,20 @@ where
             (None, Some(v)) => Some(v),
             (None, None) => {
                 let r = resolver::resolve(&state.yt, &state.db, &it.artist, &it.title, it.duration).await;
-                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                 match r {
                     Ok(t) => t.map(|t| t.video_id),
                     Err(e) => {
-                        tracing::debug!("resolve {} - {}: {e:#}", it.artist, it.title);
+                        tracing::warn!("lookup failed for {} - {}: {e:#}", it.artist, it.title);
+                        status = "error";
                         None
                     }
                 }
             }
         };
+        if video_id.is_some() {
+            status = "matched";
+        }
         if video_id.is_some() {
             matched += 1;
         }
@@ -104,7 +110,10 @@ where
                      VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
                      ON CONFLICT(provider,provider_id) DO UPDATE SET
                        title=excluded.title, artist=excluded.artist, album=excluded.album,
-                       duration=excluded.duration, video_id=excluded.video_id, status=excluded.status",
+                       duration=excluded.duration,
+                       -- never overwrite a match the user picked by hand
+                       video_id=CASE WHEN liked.status='manual' THEN liked.video_id ELSE excluded.video_id END,
+                       status=CASE WHEN liked.status='manual' THEN 'manual' ELSE excluded.status END",
                     params![
                         p,
                         it.provider_id,
@@ -113,7 +122,7 @@ where
                         it.album,
                         it.duration,
                         video_id,
-                        if video_id.is_some() { "matched" } else { "unmatched" },
+                        status,
                         now()
                     ],
                 )?;
@@ -155,6 +164,134 @@ async fn ensure_track(state: &SharedState, video_id: &str, it: &ImportItem) {
     if let Some(t) = track {
         let _ = state.db.upsert_tracks(vec![t]).await;
     }
+}
+
+// ---- retry unmatched ---------------------------------------------------------------
+
+/// Re-run matching for library entries that are unmatched or whose lookup failed,
+/// ignoring cached "no match" results.
+pub async fn start_rematch(state: SharedState) -> anyhow::Result<i64> {
+    let job_id = state
+        .db
+        .call(|c| {
+            c.execute("INSERT INTO import_jobs(provider,status,started_at) VALUES('rematch','running',?1)", params![now()])?;
+            Ok(c.last_insert_rowid())
+        })
+        .await?;
+    tokio::spawn(async move {
+        let res = rematch(&state, job_id).await;
+        let (status, err) = match res {
+            Ok(()) => ("done", None),
+            Err(e) => ("failed", Some(format!("{e:#}"))),
+        };
+        let _ = state
+            .db
+            .call(move |c| {
+                c.execute("UPDATE import_jobs SET status=?1, error=?2, finished_at=?3 WHERE id=?4", params![status, err, now(), job_id])
+            })
+            .await;
+        state.emit(ServerEvent::Import { job_id });
+    });
+    Ok(job_id)
+}
+
+async fn rematch(state: &SharedState, job_id: i64) -> anyhow::Result<()> {
+    let rows: Vec<(i64, String, String, Option<u32>)> = state
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT id, artist, title, duration FROM liked WHERE status IN ('unmatched','error')")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect()
+        })
+        .await?;
+    let total = rows.len() as i64;
+    state.db.call(move |c| c.execute("UPDATE import_jobs SET total=?1 WHERE id=?2", params![total, job_id])).await?;
+    let mut matched = 0i64;
+    for (i, (id, artist, title, duration)) in rows.into_iter().enumerate() {
+        let (vid, status) = match resolver::resolve_opts(&state.yt, &state.db, &artist, &title, duration, true).await {
+            Ok(Some(t)) => (Some(t.video_id), "matched"),
+            Ok(None) => (None, "unmatched"),
+            Err(e) => {
+                tracing::warn!("lookup failed for {artist} - {title}: {e:#}");
+                (None, "error")
+            }
+        };
+        if vid.is_some() {
+            matched += 1;
+        }
+        let done = i as i64 + 1;
+        state
+            .db
+            .call(move |c| {
+                c.execute("UPDATE liked SET video_id=?1, status=?2 WHERE id=?3 AND status<>'manual'", params![vid, status, id])?;
+                c.execute("UPDATE import_jobs SET done=?1, matched=?2 WHERE id=?3", params![done, matched, job_id])
+            })
+            .await?;
+        if done % 10 == 0 {
+            state.emit(ServerEvent::Import { job_id });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    }
+    Ok(())
+}
+
+// ---- Last.fm loved tracks ---------------------------------------------------------------
+
+pub const LASTFM_SYNC_PREF: &str = "prefs.lastfm_sync_loves";
+
+pub async fn lastfm_loved(state: SharedState) -> anyhow::Result<Vec<ImportItem>> {
+    let loved = state.lastfm.loved_tracks().await?;
+    let items: Vec<ImportItem> = loved
+        .into_iter()
+        .map(|(artist, title)| ImportItem {
+            provider_id: format!("{}|{}", artist.to_lowercase(), title.to_lowercase()),
+            title,
+            artist,
+            album: None,
+            duration: None,
+            video_id: None,
+        })
+        .collect();
+    // Mirror un-loves: drop Last.fm entries that are no longer loved.
+    let keep: std::collections::HashSet<String> = items.iter().map(|i| i.provider_id.clone()).collect();
+    let existing: Vec<(i64, String)> = state
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT id, provider_id FROM liked WHERE provider='lastfm'")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+        .await?;
+    let gone: Vec<i64> = existing.into_iter().filter(|(_, pid)| !keep.contains(pid)).map(|(id, _)| id).collect();
+    if !gone.is_empty() {
+        let n = gone.len();
+        state
+            .db
+            .call(move |c| {
+                for id in gone {
+                    c.execute("DELETE FROM liked WHERE id=?1", [id])?;
+                }
+                Ok(())
+            })
+            .await?;
+        tracing::info!("removed {n} tracks no longer loved on Last.fm");
+    }
+    Ok(items)
+}
+
+/// Daily Last.fm loves sync, when enabled.
+pub fn spawn_lastfm_sync(state: SharedState) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        loop {
+            if state.db.get_bool(LASTFM_SYNC_PREF, false).await && state.lastfm.session().await.is_some() {
+                if let Err(e) = start(state.clone(), "lastfm", lastfm_loved(state.clone())).await {
+                    tracing::warn!("Last.fm loves sync: {e:#}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+        }
+    });
 }
 
 // ---- YouTube Music ------------------------------------------------------------

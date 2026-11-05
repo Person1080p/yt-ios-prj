@@ -7,7 +7,11 @@ use md5::{Digest, Md5};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{db::Db, models::Track, services::matching};
+use crate::{
+    db::Db,
+    models::Track,
+    services::{cache, matching},
+};
 
 const API: &str = "https://ws.audioscrobbler.com/2.0/";
 
@@ -19,7 +23,7 @@ pub struct LastFm {
     env_secret: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Similar {
     pub artist: String,
     pub title: String,
@@ -133,6 +137,59 @@ impl LastFm {
         Ok(())
     }
 
+    pub async fn unlove(&self, t: &Track) -> anyhow::Result<()> {
+        self.call("track.unlove", vec![("artist", first_artist(&t.artist)), ("track", t.title.clone())], true, true)
+            .await
+            .map(|_| ())
+    }
+
+    /// Whether the connected user has loved this track (None if not connected / unknown track).
+    pub async fn is_loved(&self, t: &Track) -> anyhow::Result<Option<bool>> {
+        let Some((_, user)) = self.session().await else { return Ok(None) };
+        let v = match self
+            .call(
+                "track.getInfo",
+                vec![("artist", first_artist(&t.artist)), ("track", matching::normalize(&t.title)), ("username", user), ("autocorrect", "1".into())],
+                false,
+                false,
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(_) => return Ok(None), // unknown to Last.fm
+        };
+        Ok(v["track"]["userloved"].as_str().map(|s| s == "1"))
+    }
+
+    /// All of the connected user's loved tracks: (artist, title).
+    pub async fn loved_tracks(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let (_, user) = self.session().await.context("Last.fm not connected")?;
+        let mut out = Vec::new();
+        let mut page = 1;
+        loop {
+            let v = self
+                .call(
+                    "user.getLovedTracks",
+                    vec![("user", user.clone()), ("limit", "1000".into()), ("page", page.to_string())],
+                    false,
+                    false,
+                )
+                .await?;
+            let tracks = v["lovedtracks"]["track"].as_array().cloned().unwrap_or_default();
+            for t in &tracks {
+                if let (Some(a), Some(n)) = (t["artist"]["name"].as_str(), t["name"].as_str()) {
+                    out.push((a.to_string(), n.to_string()));
+                }
+            }
+            let total: u32 = v["lovedtracks"]["@attr"]["totalPages"].as_str().and_then(|s| s.parse().ok()).unwrap_or(1);
+            if tracks.is_empty() || page >= total {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
     pub async fn love(&self, t: &Track) -> anyhow::Result<()> {
         self.call("track.love", vec![("artist", first_artist(&t.artist)), ("track", t.title.clone())], true, true)
             .await
@@ -140,6 +197,11 @@ impl LastFm {
     }
 
     pub async fn similar_tracks(&self, artist: &str, title: &str, limit: u32) -> anyhow::Result<Vec<Similar>> {
+        let key = format!("lastfm:similar:{limit}:{}|{}", matching::primary_artist(artist), matching::normalize(title));
+        cache::cached(&self.db, &key, 7 * cache::DAY, false, || self.fetch_similar(artist, title, limit)).await
+    }
+
+    async fn fetch_similar(&self, artist: &str, title: &str, limit: u32) -> anyhow::Result<Vec<Similar>> {
         let v = self
             .call(
                 "track.getSimilar",
@@ -172,6 +234,11 @@ impl LastFm {
     /// The connected user's top tracks over the last month (seeds for discovery).
     pub async fn top_tracks(&self, limit: u32) -> anyhow::Result<Vec<Similar>> {
         let Some((_, user)) = self.session().await else { return Ok(vec![]) };
+        let key = format!("lastfm:top:{user}:{limit}");
+        cache::cached(&self.db, &key, 6 * cache::HOUR, false, || self.fetch_top(user.clone(), limit)).await
+    }
+
+    async fn fetch_top(&self, user: String, limit: u32) -> anyhow::Result<Vec<Similar>> {
         let v = self
             .call(
                 "user.getTopTracks",

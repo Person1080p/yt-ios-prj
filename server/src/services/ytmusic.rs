@@ -18,7 +18,7 @@ use sha1::{Digest, Sha1};
 use crate::{
     db::Db,
     models::{parse_duration, HomeItem, Shelf, Track},
-    services::profile,
+    services::{cache, profile},
 };
 
 const BASE: &str = "https://music.youtube.com/youtubei/v1/";
@@ -61,11 +61,31 @@ pub fn cookie_header(cookies: &[crate::services::ytdlp::BrowserCookie]) -> Optio
 pub struct YtMusic {
     http: reqwest::Client,
     db: Db,
+    /// When Google starts refusing us ("unusual traffic"), every request waits until this passes.
+    cooldown: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 impl YtMusic {
     pub fn new(http: reqwest::Client, db: Db) -> Self {
-        Self { http, db }
+        Self { http, db, cooldown: Default::default() }
+    }
+
+    async fn wait_for_cooldown(&self) {
+        let until = *self.cooldown.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = until {
+            let now = std::time::Instant::now();
+            if t > now {
+                tokio::time::sleep(t - now).await;
+            }
+        }
+    }
+
+    fn start_cooldown(&self, secs: u64) {
+        let mut c = self.cooldown.lock().unwrap_or_else(|p| p.into_inner());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        if c.map_or(true, |t| t < until) {
+            *c = Some(until);
+        }
     }
 
     /// The saved Google sign-in, regardless of the active profile.
@@ -121,6 +141,41 @@ impl YtMusic {
             client["visitorData"] = json!(v);
         }
         body["context"] = json!({ "client": client, "user": {} });
+
+        // Bulk work (imports) can trip YouTube's rate limits: back off and retry instead of
+        // treating a refused request as "no result".
+        let mut attempt = 0;
+        loop {
+            self.wait_for_cooldown().await;
+            match self.send_once(endpoint, &body, &creds).await {
+                Ok(v) => {
+                    // A new fresh-profile visitor: remember the id YouTube assigned so it stays the same listener.
+                    if let Creds::Visitor(None) = creds {
+                        if let Some(id) = v["responseContext"]["visitorData"].as_str() {
+                            let _ = self.db.set_setting(profile::FRESH_VISITOR_KEY, id).await;
+                        }
+                    }
+                    return Ok(v);
+                }
+                Err(SendError::RateLimited(_)) if attempt < 4 => {
+                    // Google's "unusual traffic" block: pause *all* requests, increasingly long.
+                    let secs = 30 * 2u64.pow(attempt);
+                    tracing::warn!("YouTube is rate-limiting us ({endpoint}); pausing requests for {secs}s");
+                    self.start_cooldown(secs);
+                    attempt += 1;
+                }
+                Err(SendError::Retryable(e)) if attempt < 4 => {
+                    let wait = std::time::Duration::from_millis(1000 * 3u64.pow(attempt));
+                    tracing::debug!("youtube music {endpoint}: {e:#}; retrying in {wait:?}");
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                }
+                Err(SendError::Retryable(e)) | Err(SendError::RateLimited(e)) | Err(SendError::Fatal(e)) => return Err(e),
+            }
+        }
+    }
+
+    async fn send_once(&self, endpoint: &str, body: &Value, creds: &Creds) -> Result<Value, SendError> {
         let mut req = self
             .http
             .post(format!("{BASE}{endpoint}?alt=json&prettyPrint=false"))
@@ -130,8 +185,9 @@ impl YtMusic {
             .header("x-origin", ORIGIN)
             .header("referer", format!("{ORIGIN}/"))
             .header("x-goog-authuser", "0")
-            .json(&body);
-        match &creds {
+            .timeout(std::time::Duration::from_secs(20))
+            .json(body);
+        match creds {
             Creds::Cookie(cookie) => {
                 if let Some(sid) = sapisid(cookie) {
                     req = req.header("authorization", sapisid_hash(&sid));
@@ -141,25 +197,69 @@ impl YtMusic {
             Creds::Visitor(Some(v)) => req = req.header("x-goog-visitor-id", v.clone()),
             _ => {}
         }
-        let resp = req.send().await?;
+        let resp = req.send().await.map_err(|e| SendError::Retryable(e.into()))?;
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            bail!("youtube music {endpoint} failed: {status} {}", text.chars().take(300).collect::<String>());
-        }
-        let v: Value = resp.json().await?;
-        // A new fresh-profile visitor: remember the id YouTube assigned so it stays the same listener.
-        if let Creds::Visitor(None) = creds {
-            if let Some(id) = v["responseContext"]["visitorData"].as_str() {
-                let _ = self.db.set_setting(profile::FRESH_VISITOR_KEY, id).await;
+            // Google answers bot detection with a 403/429 "Sorry…" HTML page.
+            let blocked = status.as_u16() == 429 || (status.as_u16() == 403 && text.contains("Sorry"));
+            if blocked {
+                return Err(SendError::RateLimited(anyhow!(
+                    "YouTube is temporarily rate-limiting this server ({status}); try again in a few minutes"
+                )));
             }
+            let err = anyhow!("youtube music {endpoint} failed: {status} {}", text.chars().take(300).collect::<String>());
+            return Err(if status.is_server_error() { SendError::Retryable(err) } else { SendError::Fatal(err) });
         }
-        Ok(v)
+        resp.json().await.map_err(|e| SendError::Retryable(e.into()))
     }
 
-    // ---- public operations ------------------------------------------------
+    /// Cache key scoped to who's asking (profile + signed in or not), since results are personalised.
+    async fn ckey(&self, kind: &str, arg: &str) -> String {
+        let p = self.db.active_profile().await;
+        let signed = self.signed_in_now().await as u8;
+        format!("yt:{p}:{signed}:{kind}:{arg}")
+    }
+
+    // ---- public operations (cached server-side) ---------------------------
 
     pub async fn search_songs(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+        let key = self.ckey("search", &format!("{limit}:{}", query.trim().to_lowercase())).await;
+        cache::cached(&self.db, &key, 6 * cache::HOUR, false, || self.fetch_search_songs(query, limit)).await
+    }
+
+    pub async fn watch_playlist(&self, video_id: Option<&str>, playlist_id: Option<&str>, limit: usize) -> anyhow::Result<Vec<Track>> {
+        let key = self
+            .ckey("watch", &format!("{}:{}:{limit}", video_id.unwrap_or(""), playlist_id.unwrap_or("")))
+            .await;
+        cache::cached(&self.db, &key, 6 * cache::HOUR, false, || self.fetch_watch_playlist(video_id, playlist_id, limit)).await
+    }
+
+    /// Home feed; `refresh` bypasses the cache (pull-to-refresh).
+    pub async fn home(&self, refresh: bool) -> anyhow::Result<Vec<Shelf>> {
+        let key = self.ckey("home", "").await;
+        cache::cached(&self.db, &key, 20 * cache::MINUTE, refresh, || self.fetch_home()).await
+    }
+
+    pub async fn playlist_tracks(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+        // Your liked songs change often; albums practically never.
+        let ttl = if id == "LM" {
+            10 * cache::MINUTE
+        } else if id.starts_with("MPRE") {
+            7 * cache::DAY
+        } else {
+            12 * cache::HOUR
+        };
+        let key = self.ckey("playlist", &format!("{id}:{limit}")).await;
+        cache::cached(&self.db, &key, ttl, false, || self.fetch_playlist_tracks(id, limit)).await
+    }
+
+    pub async fn song_info(&self, video_id: &str) -> anyhow::Result<Track> {
+        let key = format!("yt:song:{video_id}");
+        cache::cached(&self.db, &key, 30 * cache::DAY, false, || self.fetch_song_info(video_id)).await
+    }
+
+    async fn fetch_search_songs(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
         let params = urlencoding::decode(SONGS_FILTER)?.into_owned();
         let v = self.post("search", json!({ "query": query, "params": params }), true).await?;
         let mut out = parse_responsive_items(&v);
@@ -169,7 +269,7 @@ impl YtMusic {
 
     /// "Radio"/up-next list for a video or playlist. This is what YouTube Music
     /// uses for its automatic queue and the core of our recommendations.
-    pub async fn watch_playlist(
+    async fn fetch_watch_playlist(
         &self,
         video_id: Option<&str>,
         playlist_id: Option<&str>,
@@ -219,7 +319,7 @@ impl YtMusic {
         Ok(tracks)
     }
 
-    pub async fn home(&self) -> anyhow::Result<Vec<Shelf>> {
+    async fn fetch_home(&self) -> anyhow::Result<Vec<Shelf>> {
         let v = self.post("browse", json!({ "browseId": "FEmusic_home" }), true).await?;
         let mut shelves = parse_shelves(&v);
         if let Some(token) = find_continuation(&v) {
@@ -231,9 +331,9 @@ impl YtMusic {
     }
 
     /// Tracks of a playlist ("PL..", "VL..", "RD..", "LM") or album ("MPRE..").
-    pub async fn playlist_tracks(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+    async fn fetch_playlist_tracks(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
         if id.starts_with("RD") {
-            return self.watch_playlist(None, Some(id), limit).await;
+            return self.fetch_watch_playlist(None, Some(id), limit).await;
         }
         let browse_id = if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
             id.to_string()
@@ -301,7 +401,7 @@ impl YtMusic {
     }
 
     /// Metadata for a single video via the player endpoint.
-    pub async fn song_info(&self, video_id: &str) -> anyhow::Result<Track> {
+    async fn fetch_song_info(&self, video_id: &str) -> anyhow::Result<Track> {
         let v = self.player(video_id).await?;
         let d = &v["videoDetails"];
         let title = d["title"].as_str().ok_or_else(|| anyhow!("no videoDetails for {video_id}"))?;
@@ -377,6 +477,14 @@ impl YtMusic {
 }
 
 // ---- auth helpers ---------------------------------------------------------
+
+enum SendError {
+    /// Google's bot detection kicked in: back off for a while.
+    RateLimited(anyhow::Error),
+    /// Server error or network hiccup: worth retrying.
+    Retryable(anyhow::Error),
+    Fatal(anyhow::Error),
+}
 
 enum Creds {
     /// Signed in with the saved Google cookie.

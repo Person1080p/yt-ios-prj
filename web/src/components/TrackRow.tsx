@@ -1,12 +1,23 @@
 import type { ReactNode } from "react";
 import { fmtTime, type Track } from "../lib/api";
 import { currentTrack, useStore } from "../lib/store";
+import { isTailnet } from "../lib/transport";
 import { MoreIcon } from "./Icons";
+
+/**
+ * Artwork through the server's cache (downloaded once, then served locally). Over the
+ * in-page tailnet an <img> can't use the tunnel, so the original URL is used there.
+ */
+export function artUrl(src?: string | null) {
+  if (!src) return src;
+  if (isTailnet() || !/^https:\/\/[^/]*(googleusercontent\.com|ggpht\.com|ytimg\.com)\//.test(src)) return src;
+  return `/api/art?u=${encodeURIComponent(src)}`;
+}
 
 export function Cover({ src, size = 48, round = false }: { src?: string | null; size?: number; round?: boolean }) {
   return (
     <div className={`cover ${round ? "round" : ""}`} style={{ width: size, height: size }}>
-      {src ? <img src={src} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span>♪</span>}
+      {src ? <img src={artUrl(src) ?? undefined} alt="" loading="lazy" referrerPolicy="no-referrer" /> : <span>♪</span>}
     </div>
   );
 }

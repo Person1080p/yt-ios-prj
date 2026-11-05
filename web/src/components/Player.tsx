@@ -1,9 +1,46 @@
 import { useNavigate } from "react-router-dom";
-import { api, fmtTime } from "../lib/api";
+import { useEffect, useState } from "react";
+import { api, fmtTime, type Track } from "../lib/api";
+import { setLiked, useLibrary } from "../lib/library";
 import { next, playRadio, previous, seek, toggle } from "../lib/player";
 import { currentTrack, useStore } from "../lib/store";
-import { ChevronDown, HeartIcon, MoreIcon, NextIcon, PauseIcon, PlayIcon, PrevIcon, QueueIcon, RadioIcon } from "./Icons";
+import { ChevronDown, HeartFilledIcon, HeartIcon, MoreIcon, NextIcon, PauseIcon, PlayIcon, PrevIcon, QueueIcon, RadioIcon } from "./Icons";
 import { Cover } from "./TrackRow";
+
+/** ♥: filled when the track is in your library or loved on Last.fm; toggles both. */
+export function HeartButton({ track, size = 22 }: { track: Track; size?: number }) {
+  const inLibrary = useLibrary((s) => s.ids.has(track.videoId));
+  const [lastfmLoved, setLastfmLoved] = useState<boolean | null>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setLastfmLoved(null);
+    let alive = true;
+    api
+      .liked(track.videoId)
+      .then((st) => alive && setLastfmLoved(st.lastfmLoved ?? null))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [track.videoId]);
+  const liked = inLibrary || lastfmLoved === true;
+  return (
+    <button
+      className={`icon-btn heart ${liked ? "on" : ""}`}
+      aria-label={liked ? "Remove from library" : "Add to library"}
+      aria-pressed={liked}
+      disabled={busy}
+      onClick={async () => {
+        setBusy(true);
+        const st = await setLiked(track, !liked);
+        if (st) setLastfmLoved(st.lastfmLoved ?? null);
+        setBusy(false);
+      }}
+    >
+      {liked ? <HeartFilledIcon size={size} /> : <HeartIcon size={size} />}
+    </button>
+  );
+}
 
 function SourceBadge() {
   const source = useStore((s) => s.source);
@@ -62,6 +99,9 @@ export function PlayerBar() {
           </div>
         </button>
         <div className="player-bar-controls">
+          <span className="hide-mobile">
+            <HeartButton track={track} size={20} />
+          </span>
           <button className="icon-btn hide-mobile" onClick={previous} aria-label="Previous">
             <PrevIcon />
           </button>
@@ -84,7 +124,6 @@ export function NowPlaying() {
   const playing = useStore((s) => s.playing);
   const buffering = useStore((s) => s.buffering);
   const openMenu = useStore((s) => s.openMenu);
-  const toast = useStore((s) => s.toastMsg);
   const nav = useNavigate();
   if (!isOpen || !track) return null;
 
@@ -113,13 +152,7 @@ export function NowPlaying() {
       </div>
       <Seekbar big />
       <div className="np-controls">
-        <button
-          className="icon-btn"
-          aria-label="Love on Last.fm"
-          onClick={() => api.love(track.videoId).then(() => toast("Loved on Last.fm")).catch((e) => toast(e.message))}
-        >
-          <HeartIcon />
-        </button>
+        <HeartButton track={track} />
         <button className="icon-btn" onClick={previous} aria-label="Previous">
           <PrevIcon size={30} />
         </button>

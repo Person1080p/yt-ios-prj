@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, type PlaylistSummary } from "../lib/api";
+import { setLiked, useLibrary } from "../lib/library";
 import { enqueue, playRadio } from "../lib/player";
 import { useStore } from "../lib/store";
-import { HeartIcon, ListIcon, PlayIcon, PlayNextIcon, PlusIcon, QueueIcon, RadioIcon, SearchIcon } from "./Icons";
+import { HeartFilledIcon, HeartIcon, ListIcon, PlayIcon, PlayNextIcon, PlusIcon, QueueIcon, RadioIcon, SearchIcon } from "./Icons";
 import { Cover } from "./TrackRow";
 
-function Sheet({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+export function Sheet({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
     window.addEventListener("keydown", onKey);
@@ -27,8 +28,8 @@ export function TrackMenu() {
   const track = useStore((s) => s.menuTrack);
   const close = () => useStore.getState().openMenu(null);
   const pick = useStore((s) => s.pickPlaylist);
-  const toast = useStore((s) => s.toastMsg);
   const nav = useNavigate();
+  const inLibrary = useLibrary((s) => (track ? s.ids.has(track.videoId) : false));
   if (!track) return null;
 
   const act = (fn: () => void) => () => {
@@ -60,11 +61,9 @@ export function TrackMenu() {
       <button className="sheet-item" onClick={() => pick([track])}>
         <ListIcon size={20} /> Add to playlist…
       </button>
-      <button
-        className="sheet-item"
-        onClick={act(() => api.love(track.videoId).then(() => toast("Loved on Last.fm")).catch((e) => toast(e.message)))}
-      >
-        <HeartIcon size={20} /> Love on Last.fm
+      <button className="sheet-item" onClick={act(() => setLiked(track, !inLibrary))}>
+        {inLibrary ? <HeartFilledIcon size={20} /> : <HeartIcon size={20} />}
+        {inLibrary ? "Remove from library" : "Add to library"}
       </button>
       <button
         className="sheet-item"

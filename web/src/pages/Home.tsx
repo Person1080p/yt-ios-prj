@@ -73,12 +73,19 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [offline, setOffline] = useState(false);
 
-  useEffect(() => {
+  const [refreshing, setRefreshing] = useState(false);
+  const load = (refresh = false) => {
+    if (refresh) setRefreshing(true);
     api
-      .home()
+      .home(refresh)
       .then((r) => setShelves(r.shelves))
-      .catch((e) => (isNotConnected(e) ? setOffline(true) : setError(e.message)));
+      .catch((e) => (isNotConnected(e) ? setOffline(true) : setError(e.message)))
+      .finally(() => setRefreshing(false));
     api.discover().then((r) => setPersonal(r.shelves)).catch(() => {});
+  };
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fresh = useProfile((s) => s.active === "fresh");
@@ -86,7 +93,12 @@ export default function Home() {
     <div className="page">
       <div className="row between home-head">
         <h1>Listen now</h1>
-        <ProfileToggle compact />
+        <div className="row gap">
+          <ProfileToggle compact />
+          <button className="btn ghost small" disabled={refreshing} onClick={() => load(true)} title="Get a fresh feed from YouTube Music">
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
       </div>
       {fresh && (
         <p className="fresh-note small">

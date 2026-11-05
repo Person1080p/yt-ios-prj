@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod fileimport;
 pub mod importers;
 pub mod lastfm;

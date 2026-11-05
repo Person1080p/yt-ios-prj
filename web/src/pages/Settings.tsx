@@ -442,6 +442,14 @@ function Preferences({ status, reload }: { status: Status; reload: () => void })
         <input type="checkbox" checked={p.reportYoutube} onChange={(e) => update({ reportYoutube: e.target.checked })} />
         <span>Add played tracks to my YouTube watch history (improves YouTube Music recommendations)</span>
       </label>
+      <label className="switch block">
+        <input type="checkbox" checked={p.loveOnLastfm} onChange={(e) => update({ loveOnLastfm: e.target.checked })} />
+        <span>♥ also loves / un-loves the song on Last.fm</span>
+      </label>
+      <label className="switch block">
+        <input type="checkbox" checked={p.syncLastfmLoves} onChange={(e) => update({ syncLastfmLoves: e.target.checked })} />
+        <span>Sync my Last.fm loved tracks into the library daily</span>
+      </label>
     </Section>
   );
 }

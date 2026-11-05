@@ -88,6 +88,12 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     finished_at INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS api_cache (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS lookup_cache (
     key        TEXT PRIMARY KEY,
     video_id   TEXT,
@@ -172,6 +178,39 @@ impl Db {
             .ok()
             .flatten()
             .unwrap_or_else(|| crate::services::profile::MAIN.to_string())
+    }
+
+    // ---- response cache -----------------------------------------------------
+
+    /// Cached value and whether it's still fresh.
+    pub async fn cache_get(&self, key: &str) -> anyhow::Result<Option<(String, bool)>> {
+        let key = key.to_string();
+        self.call(move |c| {
+            c.query_row("SELECT value, expires_at FROM api_cache WHERE key=?1", [key], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? > now()))
+            })
+            .optional()
+        })
+        .await
+    }
+
+    pub async fn cache_put(&self, key: &str, value: &str, ttl_secs: i64) -> anyhow::Result<()> {
+        let (key, value) = (key.to_string(), value.to_string());
+        self.call(move |c| {
+            c.execute(
+                "INSERT INTO api_cache(key,value,expires_at) VALUES(?1,?2,?3)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at",
+                params![key, value, now() + ttl_secs],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// Drop entries that expired more than a week ago (stale entries are kept a while as a
+    /// fallback for when YouTube errors).
+    pub async fn cache_purge(&self) -> anyhow::Result<usize> {
+        self.call(|c| c.execute("DELETE FROM api_cache WHERE expires_at < ?1", [now() - 7 * 86400])).await
     }
 
     pub async fn get_bool(&self, key: &str, default: bool) -> bool {
