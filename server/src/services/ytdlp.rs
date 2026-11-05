@@ -1,0 +1,294 @@
+//! yt-dlp integration.
+//!
+//! The binary is located in this order:
+//!   1. `YTDLP_PATH`
+//!   2. compiled into the server (`--features embed-ytdlp`), extracted to the data dir
+//!   3. a previously downloaded copy in `<data>/bin/yt-dlp`
+//!   4. `yt-dlp` on `$PATH`
+//!   5. downloaded automatically from the official GitHub release
+//!
+//! Audio is served by resolving the direct googlevideo URL and proxying it with
+//! Range support (so seeking works), falling back to piping yt-dlp's stdout.
+
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::{Duration, Instant},
+};
+
+use anyhow::{bail, Context};
+use serde::Serialize;
+use serde_json::Value;
+use tokio::{process::Command, sync::Mutex};
+
+const FORMAT: &str = "bestaudio[ext=m4a]/bestaudio[acodec=opus]/bestaudio/best";
+const URL_TTL: Duration = Duration::from_secs(60 * 60 * 4);
+
+#[cfg(feature = "embed-ytdlp")]
+static EMBEDDED: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/yt-dlp"));
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedStream {
+    pub url: String,
+    pub mime: String,
+    pub content_length: Option<u64>,
+    #[serde(skip)]
+    pub headers: HashMap<String, String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration: Option<u32>,
+    pub thumbnail: Option<String>,
+}
+
+pub struct YtDlp {
+    http: reqwest::Client,
+    configured: Option<PathBuf>,
+    data_dir: PathBuf,
+    bin: Mutex<Option<PathBuf>>,
+    cache: Mutex<HashMap<String, (ResolvedStream, Instant)>>,
+}
+
+impl YtDlp {
+    pub fn new(http: reqwest::Client, configured: Option<PathBuf>, data_dir: PathBuf) -> Self {
+        Self { http, configured, data_dir, bin: Mutex::new(None), cache: Mutex::new(HashMap::new()) }
+    }
+
+    fn managed_path(&self) -> PathBuf {
+        let name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
+        self.data_dir.join("bin").join(name)
+    }
+
+    /// Returns a usable yt-dlp path, installing it if necessary.
+    pub async fn binary(&self) -> anyhow::Result<PathBuf> {
+        let mut guard = self.bin.lock().await;
+        if let Some(p) = guard.as_ref() {
+            return Ok(p.clone());
+        }
+        let path = self.locate().await?;
+        tracing::info!("using yt-dlp at {}", path.display());
+        *guard = Some(path.clone());
+        Ok(path)
+    }
+
+    async fn locate(&self) -> anyhow::Result<PathBuf> {
+        if let Some(p) = &self.configured {
+            return Ok(p.clone());
+        }
+        let managed = self.managed_path();
+
+        #[cfg(feature = "embed-ytdlp")]
+        if !managed.exists() {
+            write_executable(&managed, EMBEDDED).await?;
+            return Ok(managed);
+        }
+
+        if managed.exists() {
+            return Ok(managed);
+        }
+        if let Some(p) = which("yt-dlp") {
+            return Ok(p);
+        }
+        self.download(&managed).await?;
+        Ok(managed)
+    }
+
+    async fn download(&self, dest: &Path) -> anyhow::Result<()> {
+        let asset = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("linux", "x86_64") => "yt-dlp_linux",
+            ("linux", "aarch64") => "yt-dlp_linux_aarch64",
+            ("linux", "arm") => "yt-dlp_linux_armv7l",
+            ("macos", _) => "yt-dlp_macos",
+            ("windows", _) => "yt-dlp.exe",
+            _ => "yt-dlp", // python zipapp, needs python3
+        };
+        let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset}");
+        tracing::info!("downloading yt-dlp from {url}");
+        let resp = self.http.get(&url).send().await?.error_for_status()?;
+        let bytes = resp.bytes().await?;
+        write_executable(dest, &bytes).await
+    }
+
+    pub async fn version(&self) -> anyhow::Result<String> {
+        let bin = self.binary().await?;
+        let out = Command::new(bin).arg("--version").output().await?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// Self-update. Only works for the managed binary; a system package should be updated by its package manager.
+    pub async fn update(&self) -> anyhow::Result<String> {
+        let bin = self.binary().await?;
+        if bin == self.managed_path() {
+            let out = Command::new(&bin).arg("-U").output().await?;
+            let mut s = String::from_utf8_lossy(&out.stdout).to_string();
+            s.push_str(&String::from_utf8_lossy(&out.stderr));
+            if !out.status.success() {
+                // The zipapp/embedded copy may not be able to self-update: re-download instead.
+                self.download(&bin).await?;
+                s.push_str("\nre-downloaded latest release");
+            }
+            Ok(s.trim().to_string())
+        } else {
+            bail!("yt-dlp at {} is not managed by ytp; update it with your package manager", bin.display())
+        }
+    }
+
+    pub async fn invalidate(&self, video_id: &str) {
+        self.cache.lock().await.remove(video_id);
+    }
+
+    /// Resolve the direct audio URL (cached for a few hours; googlevideo URLs expire after ~6h).
+    pub async fn resolve(&self, video_id: &str) -> anyhow::Result<ResolvedStream> {
+        if let Some((s, at)) = self.cache.lock().await.get(video_id) {
+            if at.elapsed() < URL_TTL {
+                return Ok(s.clone());
+            }
+        }
+        let bin = self.binary().await?;
+        let out = Command::new(bin)
+            .args(["-f", FORMAT, "-j", "--no-playlist", "--no-warnings", "--no-progress"])
+            .arg(watch_url(video_id))
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .context("running yt-dlp")?;
+        if !out.status.success() {
+            bail!("yt-dlp failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).context("parsing yt-dlp json")?;
+        let url = v["url"].as_str().context("yt-dlp returned no url")?.to_string();
+        let ext = v["ext"].as_str().unwrap_or("m4a");
+        let mime = match ext {
+            "m4a" | "mp4" => "audio/mp4",
+            "webm" => "audio/webm",
+            "mp3" => "audio/mpeg",
+            "ogg" | "opus" => "audio/ogg",
+            _ => "application/octet-stream",
+        }
+        .to_string();
+        let headers = v["http_headers"]
+            .as_object()
+            .map(|m| m.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect())
+            .unwrap_or_default();
+        let s = |k: &str| v[k].as_str().map(String::from);
+        let resolved = ResolvedStream {
+            url,
+            mime,
+            content_length: v["filesize"].as_u64().or_else(|| v["filesize_approx"].as_u64()),
+            headers,
+            title: s("track").or_else(|| s("title")),
+            artist: s("artist").or_else(|| s("uploader").map(|u| u.trim_end_matches(" - Topic").to_string())),
+            album: s("album"),
+            duration: v["duration"].as_f64().map(|d| d.round() as u32),
+            thumbnail: s("thumbnail"),
+        };
+        self.cache.lock().await.insert(video_id.to_string(), (resolved.clone(), Instant::now()));
+        Ok(resolved)
+    }
+
+    /// Spawn yt-dlp writing the audio to stdout. The child is killed when the returned value is dropped.
+    pub async fn pipe(&self, video_id: &str) -> anyhow::Result<tokio::process::Child> {
+        let bin = self.binary().await?;
+        let child = Command::new(bin)
+            .args(["-f", FORMAT, "-o", "-", "--quiet", "--no-playlist", "--no-part"])
+            .arg(watch_url(video_id))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning yt-dlp")?;
+        Ok(child)
+    }
+}
+
+/// A cookie read from a local browser profile.
+#[derive(Debug, Clone)]
+pub struct BrowserCookie {
+    pub domain: String,
+    pub name: String,
+    pub value: String,
+}
+
+impl YtDlp {
+    /// Read the cookies of a browser installed on this machine (`firefox`, `chrome`, `chromium`,
+    /// `brave`, `edge`, `vivaldi`, `opera`, optionally `name:profile`) using yt-dlp's
+    /// `--cookies-from-browser`, which handles profile discovery (incl. snap/flatpak) and
+    /// Chromium cookie decryption. Works offline: yt-dlp dumps the jar and exits.
+    pub async fn browser_cookies(&self, browser: &str) -> anyhow::Result<Vec<BrowserCookie>> {
+        let bin = self.binary().await?;
+        // Private, short-lived directory: these are session secrets.
+        let dir = self.data_dir.join(format!("cookies-{}", uuid::Uuid::new_v4().simple()));
+        tokio::fs::create_dir_all(&dir).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).await?;
+        }
+        let file = dir.join("cookies.txt");
+        let result = async {
+            let out = tokio::time::timeout(
+                Duration::from_secs(60),
+                Command::new(bin)
+                    .args(["--ignore-config", "--no-warnings", "--cookies-from-browser", browser, "--cookies"])
+                    .arg(&file)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .context("timed out reading browser cookies")??;
+            // Without a URL yt-dlp exits with status 2 *after* writing the jar; only the file matters.
+            let text = tokio::fs::read_to_string(&file).await.map_err(|_| {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let line = err.lines().find(|l| l.contains("ERROR")).unwrap_or("no cookie store found").trim().to_string();
+                anyhow::anyhow!("{browser}: {line}")
+            })?;
+            Ok(parse_netscape_cookies(&text))
+        }
+        .await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        result
+    }
+}
+
+/// Parse a Netscape/Mozilla cookies.txt file.
+pub fn parse_netscape_cookies(text: &str) -> Vec<BrowserCookie> {
+    text.lines()
+        .filter_map(|line| {
+            // "#HttpOnly_" marks HttpOnly cookies; other '#' lines are comments.
+            let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+            if line.starts_with('#') || line.trim().is_empty() {
+                return None;
+            }
+            let f: Vec<&str> = line.split('\t').collect();
+            (f.len() >= 7).then(|| BrowserCookie { domain: f[0].to_string(), name: f[5].to_string(), value: f[6].to_string() })
+        })
+        .collect()
+}
+
+fn watch_url(video_id: &str) -> String {
+    format!("https://music.youtube.com/watch?v={video_id}")
+}
+
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+async fn write_executable(dest: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = dest.with_extension("tmp");
+    tokio::fs::write(&tmp, bytes).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).await?;
+    }
+    tokio::fs::rename(&tmp, dest).await?;
+    Ok(())
+}

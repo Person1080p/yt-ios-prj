@@ -1,0 +1,778 @@
+//! Minimal YouTube Music (InnerTube `WEB_REMIX`) client.
+//!
+//! There is no official API, so this talks to the same private endpoints the
+//! music.youtube.com web client uses. Responses are parsed defensively by
+//! walking the JSON for known renderer types rather than hard-coding paths,
+//! which keeps it working across most of YouTube's frequent layout shuffles.
+//!
+//! Authentication (needed for personalised home, liked songs and play history)
+//! uses the browser cookie header copied from a logged-in music.youtube.com tab.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context};
+use rand::Rng;
+use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+
+use crate::{
+    db::Db,
+    models::{parse_duration, HomeItem, Shelf, Track},
+    services::profile,
+};
+
+const BASE: &str = "https://music.youtube.com/youtubei/v1/";
+const ORIGIN: &str = "https://music.youtube.com";
+const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
+/// Search params for the "Songs" filter.
+const SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+pub const COOKIE_KEY: &str = "ytmusic.cookie";
+/// Where the cookie came from: "manual", or "browser:<name>" when imported (and kept in sync)
+/// from a browser on the server machine.
+pub const COOKIE_SOURCE_KEY: &str = "ytmusic.cookie_source";
+pub const COOKIE_SYNCED_KEY: &str = "ytmusic.cookie_synced_at";
+pub const ACCOUNT_KEY: &str = "ytmusic.cookie_account";
+
+/// Browsers tried, in order, when importing a sign-in.
+pub const BROWSERS: &[&str] = &["firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "opera"];
+
+/// Build the `Cookie` header music.youtube.com would receive from a browser's cookie jar.
+/// Returns None unless the jar holds a signed-in YouTube session.
+pub fn cookie_header(cookies: &[crate::services::ytdlp::BrowserCookie]) -> Option<String> {
+    let mut picked: Vec<(&str, &str, usize)> = Vec::new(); // (name, value, specificity)
+    for c in cookies {
+        let d = c.domain.trim_start_matches('.');
+        let specificity = match d {
+            "music.youtube.com" => 2,
+            "youtube.com" => 1,
+            _ => continue,
+        };
+        match picked.iter_mut().find(|(n, _, _)| *n == c.name) {
+            Some(p) if p.2 < specificity => *p = (&c.name, &c.value, specificity),
+            Some(_) => {}
+            None => picked.push((&c.name, &c.value, specificity)),
+        }
+    }
+    let header = picked.iter().map(|(n, v, _)| format!("{n}={v}")).collect::<Vec<_>>().join("; ");
+    sapisid(&header).map(|_| header)
+}
+
+#[derive(Clone)]
+pub struct YtMusic {
+    http: reqwest::Client,
+    db: Db,
+}
+
+impl YtMusic {
+    pub fn new(http: reqwest::Client, db: Db) -> Self {
+        Self { http, db }
+    }
+
+    /// The saved Google sign-in, regardless of the active profile.
+    pub async fn stored_cookie(&self) -> Option<String> {
+        self.db.get_setting(COOKIE_KEY).await.ok().flatten()
+    }
+
+    async fn fresh_profile(&self) -> bool {
+        self.db.active_profile().await == profile::FRESH
+    }
+
+    /// The sign-in to use right now: none while the fresh profile is active.
+    pub async fn cookie(&self) -> Option<String> {
+        if self.fresh_profile().await {
+            return None;
+        }
+        self.stored_cookie().await
+    }
+
+    /// Whether a Google sign-in is saved (shown in Settings).
+    pub async fn is_authenticated(&self) -> bool {
+        self.stored_cookie().await.map(|c| sapisid(&c).is_some()).unwrap_or(false)
+    }
+
+    /// Whether requests are currently made as the signed-in account.
+    pub async fn signed_in_now(&self) -> bool {
+        self.cookie().await.map(|c| sapisid(&c).is_some()).unwrap_or(false)
+    }
+
+    /// Credentials for the active profile: the Google cookie, or for the fresh profile an
+    /// anonymous visitor id of its own (so YouTube treats it as one consistent new listener).
+    async fn active_creds(&self) -> Creds {
+        if self.fresh_profile().await {
+            Creds::Visitor(self.db.get_setting(profile::FRESH_VISITOR_KEY).await.ok().flatten())
+        } else {
+            self.stored_cookie().await.map(Creds::Cookie).unwrap_or(Creds::Anonymous)
+        }
+    }
+
+    async fn post(&self, endpoint: &str, body: Value, auth: bool) -> anyhow::Result<Value> {
+        let creds = if auth { self.active_creds().await } else { Creds::Anonymous };
+        self.post_with(endpoint, body, creds).await
+    }
+
+    async fn post_with(&self, endpoint: &str, mut body: Value, creds: Creds) -> anyhow::Result<Value> {
+        let mut client = json!({
+            "clientName": "WEB_REMIX",
+            "clientVersion": client_version(),
+            "hl": "en",
+            "gl": "US",
+        });
+        if let Creds::Visitor(Some(v)) = &creds {
+            client["visitorData"] = json!(v);
+        }
+        body["context"] = json!({ "client": client, "user": {} });
+        let mut req = self
+            .http
+            .post(format!("{BASE}{endpoint}?alt=json&prettyPrint=false"))
+            .header("user-agent", UA)
+            .header("accept", "*/*")
+            .header("origin", ORIGIN)
+            .header("x-origin", ORIGIN)
+            .header("referer", format!("{ORIGIN}/"))
+            .header("x-goog-authuser", "0")
+            .json(&body);
+        match &creds {
+            Creds::Cookie(cookie) => {
+                if let Some(sid) = sapisid(cookie) {
+                    req = req.header("authorization", sapisid_hash(&sid));
+                }
+                req = req.header("cookie", cookie.clone());
+            }
+            Creds::Visitor(Some(v)) => req = req.header("x-goog-visitor-id", v.clone()),
+            _ => {}
+        }
+        let resp = req.send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            bail!("youtube music {endpoint} failed: {status} {}", text.chars().take(300).collect::<String>());
+        }
+        let v: Value = resp.json().await?;
+        // A new fresh-profile visitor: remember the id YouTube assigned so it stays the same listener.
+        if let Creds::Visitor(None) = creds {
+            if let Some(id) = v["responseContext"]["visitorData"].as_str() {
+                let _ = self.db.set_setting(profile::FRESH_VISITOR_KEY, id).await;
+            }
+        }
+        Ok(v)
+    }
+
+    // ---- public operations ------------------------------------------------
+
+    pub async fn search_songs(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+        let params = urlencoding::decode(SONGS_FILTER)?.into_owned();
+        let v = self.post("search", json!({ "query": query, "params": params }), true).await?;
+        let mut out = parse_responsive_items(&v);
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// "Radio"/up-next list for a video or playlist. This is what YouTube Music
+    /// uses for its automatic queue and the core of our recommendations.
+    pub async fn watch_playlist(
+        &self,
+        video_id: Option<&str>,
+        playlist_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Track>> {
+        let mut body = json!({
+            "enablePersistentPlaylistPanel": true,
+            "isAudioOnly": true,
+            "tunerSettingValue": "AUTOMIX_SETTING_NORMAL",
+        });
+        match (video_id, playlist_id) {
+            (Some(v), Some(p)) => {
+                body["videoId"] = json!(v);
+                body["playlistId"] = json!(p);
+            }
+            (Some(v), None) => {
+                body["videoId"] = json!(v);
+                body["playlistId"] = json!(format!("RDAMVM{v}"));
+                body["watchEndpointMusicSupportedConfigs"] = json!({
+                    "watchEndpointMusicConfig": { "hasPersistentPlaylistPanel": true, "musicVideoType": "MUSIC_VIDEO_TYPE_ATV" }
+                });
+            }
+            (None, Some(p)) => body["playlistId"] = json!(p),
+            (None, None) => bail!("video_id or playlist_id required"),
+        }
+
+        let v = self.post("next", body, true).await?;
+        let mut tracks = parse_panel_items(&v);
+        // Follow continuations for longer mixes.
+        let mut token = find_continuation(&v);
+        let mut pages = 0;
+        while tracks.len() < limit && pages < 5 {
+            let Some(t) = token.take() else { break };
+            let next = self
+                .post("next", json!({ "continuation": t, "enablePersistentPlaylistPanel": true, "isAudioOnly": true }), true)
+                .await?;
+            let more = parse_panel_items(&next);
+            if more.is_empty() {
+                break;
+            }
+            tracks.extend(more);
+            token = find_continuation(&next);
+            pages += 1;
+        }
+        dedupe(&mut tracks);
+        tracks.truncate(limit);
+        Ok(tracks)
+    }
+
+    pub async fn home(&self) -> anyhow::Result<Vec<Shelf>> {
+        let v = self.post("browse", json!({ "browseId": "FEmusic_home" }), true).await?;
+        let mut shelves = parse_shelves(&v);
+        if let Some(token) = find_continuation(&v) {
+            if let Ok(more) = self.post("browse", json!({ "continuation": token }), true).await {
+                shelves.extend(parse_shelves(&more));
+            }
+        }
+        Ok(shelves)
+    }
+
+    /// Tracks of a playlist ("PL..", "VL..", "RD..", "LM") or album ("MPRE..").
+    pub async fn playlist_tracks(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
+        if id.starts_with("RD") {
+            return self.watch_playlist(None, Some(id), limit).await;
+        }
+        let browse_id = if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
+            id.to_string()
+        } else {
+            format!("VL{id}")
+        };
+        let v = self.post("browse", json!({ "browseId": browse_id }), true).await?;
+        let header = header_info(&v);
+        let mut tracks = parse_responsive_items(&v);
+        let mut token = find_continuation(&v);
+        let mut pages = 0;
+        while tracks.len() < limit && pages < 200 {
+            let Some(t) = token.take() else { break };
+            let next = self.post("browse", json!({ "continuation": t }), true).await?;
+            let more = parse_responsive_items(&next);
+            if more.is_empty() {
+                break;
+            }
+            tracks.extend(more);
+            token = find_continuation(&next);
+            pages += 1;
+        }
+        // Album tracks don't carry artist/thumbnail per row: inherit from the header.
+        for t in &mut tracks {
+            if t.artist.is_empty() {
+                t.artist = header.artist.clone().unwrap_or_default();
+            }
+            if t.thumbnail.is_none() {
+                t.thumbnail = header.thumbnail.clone();
+            }
+            if t.album.is_none() && browse_id.starts_with("MPRE") {
+                t.album = header.title.clone();
+            }
+        }
+        dedupe(&mut tracks);
+        tracks.truncate(limit);
+        Ok(tracks)
+    }
+
+    /// The signed-in account's name, or None if YouTube treats the request as signed out.
+    ///
+    /// YouTube doesn't reject invalid credentials — it silently answers as a logged-out
+    /// visitor — so this is the only reliable way to tell whether a cookie works.
+    pub async fn account_name(&self) -> anyhow::Result<Option<String>> {
+        // Always checks the saved sign-in, whichever profile is active.
+        let Some(cookie) = self.stored_cookie().await else { return Ok(None) };
+        let v = self.post_with("account/account_menu", json!({}), Creds::Cookie(cookie)).await?;
+        Ok(find_first(&v, "activeAccountHeaderRenderer").map(|h| {
+            let name = text(&h["accountName"]);
+            let handle = text(&h["channelHandle"]);
+            match (name.is_empty(), handle.is_empty()) {
+                (false, false) => format!("{name} ({handle})"),
+                (false, true) => name,
+                (true, false) => handle,
+                (true, true) => "your Google account".to_string(),
+            }
+        }))
+    }
+
+    pub async fn liked_songs(&self, limit: usize) -> anyhow::Result<Vec<Track>> {
+        if !self.signed_in_now().await {
+            bail!("Liked songs need your YouTube Music sign-in (switch off Fresh start, or sign in in Settings)");
+        }
+        self.playlist_tracks("LM", limit).await
+    }
+
+    /// Metadata for a single video via the player endpoint.
+    pub async fn song_info(&self, video_id: &str) -> anyhow::Result<Track> {
+        let v = self.player(video_id).await?;
+        let d = &v["videoDetails"];
+        let title = d["title"].as_str().ok_or_else(|| anyhow!("no videoDetails for {video_id}"))?;
+        Ok(Track {
+            video_id: video_id.to_string(),
+            title: title.to_string(),
+            artist: d["author"].as_str().unwrap_or_default().trim_end_matches(" - Topic").to_string(),
+            album: None,
+            duration: d["lengthSeconds"].as_str().and_then(|s| s.parse().ok()),
+            thumbnail: last_thumbnail(&d["thumbnail"]),
+        })
+    }
+
+    async fn player(&self, video_id: &str) -> anyhow::Result<Value> {
+        self.post(
+            "player",
+            json!({
+                "videoId": video_id,
+                "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": 0 } }
+            }),
+            true,
+        )
+        .await
+    }
+
+    /// Register a play in the user's YouTube / YouTube Music history.
+    ///
+    /// Mirrors what the web player does: fetch the player response for the
+    /// video and ping its `videostatsPlaybackUrl` with a client playback nonce.
+    /// Needs the Google sign-in: YouTube doesn't return playback tracking to anonymous visitors.
+    pub async fn add_history(&self, video_id: &str) -> anyhow::Result<()> {
+        let creds = self.active_creds().await;
+        if !matches!(creds, Creds::Cookie(_)) {
+            bail!("YouTube history needs your YouTube Music sign-in");
+        }
+        let v = self.post_with(
+            "player",
+            json!({
+                "videoId": video_id,
+                "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": 0 } }
+            }),
+            self.active_creds().await,
+        ).await?;
+        let url = v["playbackTracking"]["videostatsPlaybackUrl"]["baseUrl"]
+            .as_str()
+            .context("player response has no videostatsPlaybackUrl (cookie expired?)")?;
+        let cpn: String = {
+            const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut rng = rand::thread_rng();
+            (0..16).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+        };
+        let mut req = self
+            .http
+            .get(url)
+            .query(&[("ver", "2"), ("c", "WEB_REMIX"), ("cpn", cpn.as_str())])
+            .header("user-agent", UA)
+            .header("origin", ORIGIN);
+        match &creds {
+            Creds::Cookie(cookie) => {
+                req = req.header("cookie", cookie.clone());
+                if let Some(sid) = sapisid(cookie) {
+                    req = req.header("authorization", sapisid_hash(&sid));
+                }
+            }
+            _ => {}
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            bail!("history ping failed: {}", resp.status());
+        }
+        Ok(())
+    }
+}
+
+// ---- auth helpers ---------------------------------------------------------
+
+enum Creds {
+    /// Signed in with the saved Google cookie.
+    Cookie(String),
+    /// Fresh profile: an anonymous visitor (None until YouTube assigns an id).
+    Visitor(Option<String>),
+    /// Plain logged-out request.
+    Anonymous,
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
+}
+
+fn sapisid(cookie: &str) -> Option<String> {
+    cookie_value(cookie, "__Secure-3PAPISID").or_else(|| cookie_value(cookie, "SAPISID"))
+}
+
+fn sapisid_hash(sapisid: &str) -> String {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mut h = Sha1::new();
+    h.update(format!("{ts} {sapisid} {ORIGIN}"));
+    format!("SAPISIDHASH {ts}_{}", hex::encode(h.finalize()))
+}
+
+fn client_version() -> String {
+    // InnerTube wants a plausible, recent date-based version: 1.YYYYMMDD.01.00
+    let days = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64 / 86400 - 1;
+    let (y, m, d) = civil_from_days(days);
+    format!("1.{y:04}{m:02}{d:02}.01.00")
+}
+
+/// Howard Hinnant's days-from-epoch -> (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+// ---- JSON walking ---------------------------------------------------------
+
+fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                if k == key {
+                    out.push(child);
+                } else {
+                    find_all(child, key, out);
+                }
+            }
+        }
+        Value::Array(arr) => arr.iter().for_each(|c| find_all(c, key, out)),
+        _ => {}
+    }
+}
+
+fn find_first<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+    match v {
+        Value::Object(map) => {
+            if let Some(x) = map.get(key) {
+                return Some(x);
+            }
+            map.values().find_map(|c| find_first(c, key))
+        }
+        Value::Array(arr) => arr.iter().find_map(|c| find_first(c, key)),
+        _ => None,
+    }
+}
+
+fn text(v: &Value) -> String {
+    if let Some(s) = v["simpleText"].as_str() {
+        return s.to_string();
+    }
+    v["runs"]
+        .as_array()
+        .map(|runs| runs.iter().filter_map(|r| r["text"].as_str()).collect::<String>())
+        .unwrap_or_default()
+}
+
+fn last_thumbnail(v: &Value) -> Option<String> {
+    let mut all = Vec::new();
+    find_all(v, "thumbnails", &mut all);
+    all.into_iter()
+        .filter_map(|t| t.as_array()?.last()?["url"].as_str())
+        .next()
+        .map(upscale_thumb)
+}
+
+/// googleusercontent thumbnails accept a size suffix; ask for something usable as cover art.
+fn upscale_thumb(url: &str) -> String {
+    if url.contains("googleusercontent.com") || url.contains("ggpht.com") {
+        if let Some(idx) = url.rfind("=w") {
+            return format!("{}=w544-h544-l90-rj", &url[..idx]);
+        }
+    }
+    url.to_string()
+}
+
+fn page_type(run: &Value) -> Option<&str> {
+    run["navigationEndpoint"]["browseEndpoint"]["browseEndpointContextSupportedConfigs"]
+        ["browseEndpointContextMusicConfig"]["pageType"]
+        .as_str()
+}
+
+fn find_continuation(v: &Value) -> Option<String> {
+    if let Some(c) = find_first(v, "nextContinuationData") {
+        if let Some(s) = c["continuation"].as_str() {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(c) = find_first(v, "nextRadioContinuationData") {
+        if let Some(s) = c["continuation"].as_str() {
+            return Some(s.to_string());
+        }
+    }
+    find_first(v, "continuationCommand").and_then(|c| c["token"].as_str()).map(String::from)
+}
+
+/// Splits a byline's runs into (artists, album, duration) using navigation page types,
+/// falling back to positional heuristics for runs without links.
+fn split_byline(runs: &[&Value]) -> (Vec<String>, Option<String>, Option<u32>) {
+    let mut artists = Vec::new();
+    let mut album = None;
+    let mut duration = None;
+    let mut plain = Vec::new();
+    for r in runs {
+        let t = r["text"].as_str().unwrap_or_default();
+        if t.trim().is_empty() || t == " • " || t == " & " || t == ", " {
+            continue;
+        }
+        match page_type(r) {
+            Some("MUSIC_PAGE_TYPE_ARTIST") | Some("MUSIC_PAGE_TYPE_USER_CHANNEL") => artists.push(t.to_string()),
+            Some("MUSIC_PAGE_TYPE_ALBUM") => album = Some(t.to_string()),
+            _ => {
+                if let Some(d) = parse_duration(t) {
+                    duration = Some(d);
+                } else if !matches!(t, "Song" | "Video" | "Episode" | "Single" | "EP" | "Album")
+                    && !t.ends_with(" views")
+                    && !t.ends_with(" plays")
+                    && !(t.len() == 4 && t.chars().all(|c| c.is_ascii_digit()))
+                {
+                    plain.push(t.to_string());
+                }
+            }
+        }
+    }
+    if artists.is_empty() {
+        if let Some(first) = plain.into_iter().next() {
+            artists.push(first);
+        }
+    }
+    (artists, album, duration)
+}
+
+fn parse_responsive(item: &Value) -> Option<Track> {
+    let video_id = item["playlistItemData"]["videoId"]
+        .as_str()
+        .or_else(|| find_first(item, "watchEndpoint").and_then(|w| w["videoId"].as_str()))?
+        .to_string();
+    let cols = item["flexColumns"].as_array()?;
+    let title = Some(text(&cols.first()?["musicResponsiveListItemFlexColumnRenderer"]["text"])).filter(|t| !t.is_empty())?;
+
+    let mut runs = Vec::new();
+    for c in cols.iter().skip(1) {
+        if let Some(rs) = c["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array() {
+            runs.extend(rs.iter());
+        }
+    }
+    let (artists, album, mut duration) = split_byline(&runs);
+    if duration.is_none() {
+        if let Some(fixed) = item["fixedColumns"].as_array().and_then(|f| f.first()) {
+            duration = parse_duration(&text(&fixed["musicResponsiveListItemFixedColumnRenderer"]["text"]));
+        }
+    }
+    Some(Track {
+        video_id,
+        title,
+        artist: artists.join(", "),
+        album,
+        duration,
+        thumbnail: last_thumbnail(&item["thumbnail"]),
+    })
+}
+
+fn parse_panel(item: &Value) -> Option<Track> {
+    let video_id = item["videoId"].as_str()?.to_string();
+    let title = text(&item["title"]);
+    let runs: Vec<&Value> = item["longBylineText"]["runs"].as_array().map(|r| r.iter().collect()).unwrap_or_default();
+    let (artists, album, _) = split_byline(&runs);
+    Some(Track {
+        video_id,
+        title,
+        artist: artists.join(", "),
+        album,
+        duration: parse_duration(&text(&item["lengthText"])),
+        thumbnail: last_thumbnail(&item["thumbnail"]),
+    })
+}
+
+pub fn parse_responsive_items(v: &Value) -> Vec<Track> {
+    let mut items = Vec::new();
+    find_all(v, "musicResponsiveListItemRenderer", &mut items);
+    let mut out: Vec<Track> = items.into_iter().filter_map(parse_responsive).collect();
+    dedupe(&mut out);
+    out
+}
+
+fn parse_panel_items(v: &Value) -> Vec<Track> {
+    let mut items = Vec::new();
+    find_all(v, "playlistPanelVideoRenderer", &mut items);
+    items.into_iter().filter_map(parse_panel).collect()
+}
+
+fn parse_two_row(item: &Value) -> Option<HomeItem> {
+    let title = text(&item["title"]);
+    let subtitle_runs: Vec<&Value> = item["subtitle"]["runs"].as_array().map(|r| r.iter().collect()).unwrap_or_default();
+    let subtitle = text(&item["subtitle"]);
+    let thumbnail = last_thumbnail(&item["thumbnailRenderer"]);
+    let nav = &item["navigationEndpoint"];
+    if let Some(w) = nav.get("watchEndpoint") {
+        let video_id = w["videoId"].as_str().map(String::from);
+        let playlist_id = w["playlistId"].as_str().map(String::from);
+        let track = video_id.as_ref().map(|vid| {
+            let (artists, album, duration) = split_byline(&subtitle_runs);
+            Track { video_id: vid.clone(), title: title.clone(), artist: artists.join(", "), album, duration, thumbnail: thumbnail.clone() }
+        });
+        return Some(HomeItem {
+            kind: if video_id.is_some() { "song" } else { "playlist" }.into(),
+            title,
+            subtitle,
+            thumbnail,
+            video_id,
+            playlist_id,
+            browse_id: None,
+            track,
+        });
+    }
+    if let Some(w) = nav.get("watchPlaylistEndpoint") {
+        return Some(HomeItem {
+            kind: "playlist".into(),
+            title,
+            subtitle,
+            thumbnail,
+            video_id: None,
+            playlist_id: w["playlistId"].as_str().map(String::from),
+            browse_id: None,
+            track: None,
+        });
+    }
+    let b = nav.get("browseEndpoint")?;
+    let browse_id = b["browseId"].as_str()?.to_string();
+    let pt = b["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"]
+        .as_str()
+        .unwrap_or_default();
+    let kind = match pt {
+        "MUSIC_PAGE_TYPE_ALBUM" | "MUSIC_PAGE_TYPE_AUDIOBOOK" => "album",
+        "MUSIC_PAGE_TYPE_ARTIST" | "MUSIC_PAGE_TYPE_USER_CHANNEL" => "artist",
+        _ => "playlist",
+    };
+    let playlist_id = (kind == "playlist").then(|| browse_id.trim_start_matches("VL").to_string());
+    Some(HomeItem { kind: kind.into(), title, subtitle, thumbnail, video_id: None, playlist_id, browse_id: Some(browse_id), track: None })
+}
+
+fn parse_shelves(v: &Value) -> Vec<Shelf> {
+    let mut shelves = Vec::new();
+    find_all(v, "musicCarouselShelfRenderer", &mut shelves);
+    shelves
+        .into_iter()
+        .filter_map(|s| {
+            let header = &s["header"]["musicCarouselShelfBasicHeaderRenderer"];
+            let title = text(&header["title"]);
+            let items: Vec<HomeItem> = s["contents"]
+                .as_array()?
+                .iter()
+                .filter_map(|c| {
+                    if let Some(two) = c.get("musicTwoRowItemRenderer") {
+                        parse_two_row(two)
+                    } else if let Some(r) = c.get("musicResponsiveListItemRenderer") {
+                        let t = parse_responsive(r)?;
+                        Some(HomeItem {
+                            kind: "song".into(),
+                            title: t.title.clone(),
+                            subtitle: t.artist.clone(),
+                            thumbnail: t.thumbnail.clone(),
+                            video_id: Some(t.video_id.clone()),
+                            playlist_id: None,
+                            browse_id: None,
+                            track: Some(t),
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            (!items.is_empty()).then_some(Shelf { title: if title.is_empty() { "For you".into() } else { title }, items })
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct HeaderInfo {
+    title: Option<String>,
+    artist: Option<String>,
+    thumbnail: Option<String>,
+}
+
+fn header_info(v: &Value) -> HeaderInfo {
+    for key in ["musicResponsiveHeaderRenderer", "musicDetailHeaderRenderer", "musicImmersiveHeaderRenderer"] {
+        if let Some(h) = find_first(v, key) {
+            let artist = h["straplineTextOne"]["runs"]
+                .as_array()
+                .or_else(|| h["subtitle"]["runs"].as_array())
+                .and_then(|runs| {
+                    runs.iter()
+                        .find(|r| matches!(page_type(r), Some("MUSIC_PAGE_TYPE_ARTIST") | Some("MUSIC_PAGE_TYPE_USER_CHANNEL")))
+                        .or_else(|| runs.first())
+                        .and_then(|r| r["text"].as_str())
+                        .map(String::from)
+                });
+            return HeaderInfo {
+                title: Some(text(&h["title"])).filter(|s| !s.is_empty()),
+                artist,
+                thumbnail: last_thumbnail(&h["thumbnail"]),
+            };
+        }
+    }
+    HeaderInfo::default()
+}
+
+pub fn dedupe(tracks: &mut Vec<Track>) {
+    let mut seen = std::collections::HashSet::new();
+    tracks.retain(|t| seen.insert(t.video_id.clone()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(20_397), (2025, 11, 5));
+    }
+
+    #[test]
+    fn parses_panel() {
+        let v = json!({"contents": [{"playlistPanelVideoRenderer": {
+            "videoId": "abc",
+            "title": {"runs": [{"text": "Song"}]},
+            "lengthText": {"runs": [{"text": "3:10"}]},
+            "longBylineText": {"runs": [
+                {"text": "Artist", "navigationEndpoint": {"browseEndpoint": {"browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}}},
+                {"text": " • "},
+                {"text": "Album", "navigationEndpoint": {"browseEndpoint": {"browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}},
+                {"text": " • "},
+                {"text": "2020"}
+            ]},
+            "thumbnail": {"thumbnails": [{"url": "a"}, {"url": "b"}]}
+        }}]});
+        let t = parse_panel_items(&v);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].artist, "Artist");
+        assert_eq!(t[0].album.as_deref(), Some("Album"));
+        assert_eq!(t[0].duration, Some(190));
+        assert_eq!(t[0].thumbnail.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn header_from_browser_jar() {
+        use crate::services::ytdlp::parse_netscape_cookies;
+        let jar = "# Netscape HTTP Cookie File\n\
+.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSAPISID\ta\n\
+#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tb\n\
+music.youtube.com\tFALSE\t/\tTRUE\t1893456000\tSID\tc\n\
+.google.com\tTRUE\t/\tTRUE\t1893456000\tSAPISID\tignored\n";
+        let h = cookie_header(&parse_netscape_cookies(jar)).unwrap();
+        assert!(h.contains("SAPISID=a"));
+        assert!(h.contains("SID=c")); // the music.youtube.com cookie wins over .youtube.com
+        assert!(!h.contains("ignored"));
+        assert!(cookie_header(&parse_netscape_cookies(".example.com\tTRUE\t/\tFALSE\t0\tx\ty\n")).is_none());
+    }
+
+    #[test]
+    fn sapisid_from_cookie() {
+        let c = "a=1; SAPISID=xyz; __Secure-3PAPISID=abc";
+        assert_eq!(sapisid(c).as_deref(), Some("abc"));
+    }
+}

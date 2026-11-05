@@ -1,0 +1,18 @@
+/server/target/
+/server/data/
+/server/vendor/yt-dlp
+/web/node_modules/
+/web/dist/
+/web/dev-dist/
+.env
+*.sqlite3*
+.playwright-mcp/
+/web/public/tailnet/
+
+# Server data (YouTube sign-in, Plex/Last.fm/Spotify tokens, Tailscale identity) wherever
+# YTP_DATA_DIR points inside the repo — not just the default server/data/.
+data/
+tailscaled.state*
+
+# TypeScript incremental build cache
+*.tsbuildinfo
