@@ -320,22 +320,47 @@ impl Plex {
 
     /// URL to fetch audio for a matched track. Browser-friendly codecs are served
     /// directly; others go through Plex's universal transcoder as MP3.
-    pub async fn stream_url(&self, t: &PlexTrack) -> anyhow::Result<String> {
+    ///
+    /// `budget_kbps` (from the browser's measured connection to this server): when the original
+    /// file is bigger than that, Plex transcodes it to an MP3 that fits. Returns the URL and the
+    /// (approximate) bitrate that will be sent.
+    pub async fn stream_url(&self, t: &PlexTrack, budget_kbps: Option<u32>) -> anyhow::Result<(String, u32)> {
         let Some((url, token)) = self.server().await else { bail!("plex not configured") };
-        let direct = matches!(
-            t.codec.as_deref().map(str::to_ascii_lowercase).as_deref(),
-            None | Some("mp3" | "aac" | "flac" | "opus" | "vorbis" | "pcm" | "wav")
-        );
-        if direct {
-            return Ok(format!("{url}{}?X-Plex-Token={}", t.part_key, urlencoding::encode(&token)));
+        let codec = t.codec.as_deref().map(str::to_ascii_lowercase);
+        let direct = matches!(codec.as_deref(), None | Some("mp3" | "aac" | "flac" | "opus" | "vorbis" | "pcm" | "wav"));
+        // The match cache doesn't keep the file's bitrate: assume typical values per codec.
+        let original = if matches!(codec.as_deref(), Some("flac" | "alac" | "pcm" | "wav")) { 1000 } else { 320 };
+        if direct && budget_kbps.map_or(true, |b| b >= original) {
+            return Ok((format!("{url}{}?X-Plex-Token={}", t.part_key, urlencoding::encode(&token)), original));
         }
+        let rate = plex_bitrate(budget_kbps);
         let cid = self.client_id().await?;
         let path = urlencoding::encode(&format!("/library/metadata/{}", t.rating_key)).into_owned();
-        Ok(format!(
-            "{url}/music/:/transcode/universal/start.mp3?path={path}&mediaIndex=0&partIndex=0&protocol=http\
-             &directPlay=0&directStream=0&musicBitrate=320&X-Plex-Product={PRODUCT}&X-Plex-Platform=Chrome\
-             &X-Plex-Client-Identifier={cid}&X-Plex-Token={}",
-            urlencoding::encode(&token)
+        Ok((
+            format!(
+                "{url}/music/:/transcode/universal/start.mp3?path={path}&mediaIndex=0&partIndex=0&protocol=http\
+                 &directPlay=0&directStream=0&musicBitrate={rate}&X-Plex-Product={PRODUCT}&X-Plex-Platform=Chrome\
+                 &X-Plex-Client-Identifier={cid}&X-Plex-Token={}",
+                urlencoding::encode(&token)
+            ),
+            rate,
         ))
+    }
+}
+
+/// MP3 bitrate for a Plex transcode within `budget_kbps` (320 when unlimited, never below 64).
+pub fn plex_bitrate(budget_kbps: Option<u32>) -> u32 {
+    let budget = budget_kbps.unwrap_or(320);
+    [320, 256, 192, 128, 96, 64].into_iter().find(|&r| r <= budget).unwrap_or(64)
+}
+
+#[cfg(test)]
+mod quality_tests {
+    #[test]
+    fn plex_bitrate_fits_budget() {
+        assert_eq!(super::plex_bitrate(None), 320);
+        assert_eq!(super::plex_bitrate(Some(200)), 192);
+        assert_eq!(super::plex_bitrate(Some(96)), 96);
+        assert_eq!(super::plex_bitrate(Some(10)), 64);
     }
 }

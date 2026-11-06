@@ -1,4 +1,5 @@
 import { apiFetch } from "./transport";
+import { qualityArgs } from "./quality";
 
 export type Track = {
   videoId: string;
@@ -46,6 +47,7 @@ export type ImportJob = {
   done: number;
   matched: number;
   error?: string | null;
+  note?: string | null;
   startedAt: number;
   finishedAt?: number | null;
 };
@@ -59,7 +61,51 @@ export type Prefs = {
   scrobble: boolean;
   reportYoutube: boolean;
   loveOnLastfm: boolean;
-  syncLastfmLoves: boolean;
+  /** Daily Last.fm loves sync: off, loves → library, or both ways. */
+  lastfmSync: "off" | "pull" | "both";
+  logYoutube: boolean;
+  /** Spacing of import/sync requests to YouTube. */
+  importPace: "original" | "normal" | "slow" | "very_slow";
+};
+
+export type YtLogEntry = {
+  ts: number;
+  kind: string;
+  endpoint: string;
+  detail: string;
+  origin: string;
+  outcome: string;
+  status?: number | null;
+  ms: number;
+  attempt: number;
+  error?: string | null;
+};
+
+export type YtLogWindow = {
+  requests: number;
+  cacheHits: number;
+  timeouts: number;
+  rateLimited: number;
+  errors: number;
+  avgMs: number;
+  maxMs: number;
+};
+
+export type YtLog = {
+  enabled: boolean;
+  /** Average spacing between background (import/sync) requests right now. */
+  backgroundGapMs: number;
+  path?: string | null;
+  stats: {
+    lastMinute: YtLogWindow;
+    last10Minutes: YtLogWindow;
+    lastHour: YtLogWindow;
+    peakPerMinute: number;
+    byEndpoint: [string, number][];
+    byOrigin: [string, number][];
+    repeated: [string, number][];
+  };
+  recent: YtLogEntry[];
 };
 
 export type LikedState = { inLibrary: boolean; lastfmLoved?: boolean | null; liked: boolean };
@@ -131,14 +177,45 @@ async function req<T>(
 
 const enc = encodeURIComponent;
 
+export type SearchResults = {
+  top: HomeItem | null;
+  songs: Track[];
+  artists: HomeItem[];
+  albums: HomeItem[];
+  playlists: HomeItem[];
+  videos: Track[];
+};
+export type SearchFilter = "songs" | "artists" | "albums";
+export type BrowseRef = { browseId: string; params?: string | null };
+export type ArtistShelf = { title: string; items: HomeItem[]; more?: BrowseRef | null };
+export type ArtistPage = {
+  id: string;
+  name: string;
+  thumbnail?: string | null;
+  description?: string | null;
+  stats?: string | null;
+  radioPlaylistId?: string | null;
+  topSongs: Track[];
+  songsPlaylistId?: string | null;
+  shelves: ArtistShelf[];
+};
+export type GridPage = { title: string; items: HomeItem[] };
+
 export const api = {
   home: (refresh = false) => req<{ shelves: Shelf[] }>(`/home${refresh ? "?refresh=1" : ""}`),
   discover: () => req<{ shelves: Shelf[] }>("/discover"),
   search: (q: string, signal?: AbortSignal) => req<Track[]>(`/search?q=${enc(q)}`, { signal }),
+  searchAll: (q: string, filter?: SearchFilter, signal?: AbortSignal) =>
+    req<SearchResults>(`/search/all?q=${enc(q)}${filter ? `&filter=${filter}` : ""}`, { signal }),
+  artist: (id: string) => req<ArtistPage>(`/artist/${enc(id)}`),
+  artistLookup: (name: string) => req<{ id: string | null }>(`/artist-lookup?name=${enc(name)}`),
+  browseGrid: (id: string, params?: string | null) =>
+    req<GridPage>(`/browse/grid?id=${enc(id)}${params ? `&params=${enc(params)}` : ""}`),
   radio: (videoId: string) => req<Track[]>(`/radio/${enc(videoId)}`),
   playlist: (id: string) => req<Track[]>(`/playlist/${enc(id)}`),
   recommendations: (videoId: string) => req<Track[]>(`/recommendations/${enc(videoId)}`),
-  source: (videoId: string) => req<{ source: "plex" | "youtube" }>(`/tracks/${enc(videoId)}/source`),
+  source: (videoId: string) =>
+    req<{ source: "plex" | "youtube"; kbps?: number | null }>(withArgs(`/tracks/${enc(videoId)}/source`, qualityArgs())),
   liked: (videoId: string) => req<LikedState>(`/tracks/${enc(videoId)}/liked`),
   setLiked: (track: Track, liked: boolean) =>
     req<LikedState>(`/tracks/${enc(track.videoId)}/liked`, { method: "PUT", body: { track, liked } }),
@@ -186,6 +263,7 @@ export const api = {
     match: (id: number, track: Track) => req<{ ok: boolean }>(`/library/liked/${id}/match`, { body: { track } }),
     rematch: () => req<{ jobId: number }>("/library/rematch", { method: "POST" }),
     importLastfm: () => req<{ jobId: number }>("/import/lastfm", { method: "POST" }),
+    syncLastfm: () => req<{ jobId: number }>("/library/sync-lastfm", { method: "POST" }),
     importYtMusic: () => req<{ jobId: number }>("/import/ytmusic", { method: "POST" }),
     importSpotify: () => req<{ jobId: number }>("/import/spotify", { method: "POST" }),
     spotifyLogin: (redirect: string) => req<{ url: string }>(`/import/spotify/login?redirect=${enc(redirect)}`),
@@ -206,6 +284,13 @@ export const api = {
 
   status: () => req<Status>("/status"),
   setPrefs: (p: Prefs) => req<Prefs>("/prefs", { method: "PUT", body: p }),
+  youtubeLog: () => req<YtLog>("/logs/youtube"),
+  clearYoutubeLog: () => req<{ ok: boolean }>("/logs/youtube", { method: "DELETE" }),
+  youtubeLogFile: async () => {
+    const res = await apiFetch("/logs/youtube/file", { method: "GET" });
+    if (!res.ok) throw new ApiError(res.status, res.statusText);
+    return res.blob();
+  },
   updateYtdlp: () => req<{ output: string; version?: string }>("/ytdlp/update", { method: "POST" }),
   setYtCookie: (cookie: string) => req<{ ok: boolean; account?: string }>("/ytmusic/cookie", { method: "PUT", body: { cookie } }),
   importYtFromBrowser: (keepInSync: boolean, browser?: string) =>
@@ -228,12 +313,21 @@ export const api = {
 };
 
 /** Raw audio response for a track (used when audio can't be loaded by URL, i.e. over the in-page tailnet). */
+function withArgs(path: string, args: string[]) {
+  return args.length ? `${path}?${args.join("&")}` : path;
+}
+
+/** `/stream/:id` with the current quality budget (see quality.ts). */
+function streamPath(videoId: string, via?: "youtube" | "pipe") {
+  return withArgs(`/stream/${enc(videoId)}`, [...(via ? [`via=${via}`] : []), ...qualityArgs()]);
+}
+
 export function fetchAudio(videoId: string, via?: "youtube" | "pipe", signal?: AbortSignal) {
-  return apiFetch(`/stream/${enc(videoId)}${via ? `?via=${via}` : ""}`, { signal });
+  return apiFetch(streamPath(videoId, via), { signal });
 }
 
 export function streamUrl(videoId: string, via?: "youtube" | "pipe") {
-  return `/api/stream/${enc(videoId)}${via ? `?via=${via}` : ""}`;
+  return `/api${streamPath(videoId, via)}`;
 }
 
 export function fmtTime(sec?: number | null) {

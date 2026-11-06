@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { startTailnet, tailnetFetch, tailnetLogin, useTailnet, type Peer } from "../lib/tailnet";
 import {
+  isBrowserNode,
   isLoopbackUrl,
   normalizeServer,
   setTailnetConfig,
@@ -25,8 +26,10 @@ export default function TailnetSetup({ onSaved }: { onSaved?: () => void }) {
 
   const [hostname, setHostname] = useState(saved?.hostname ?? defaultHostname());
   const [authKey, setAuthKey] = useState("");
-  const [server, setServer] = useState(saved?.server ?? suggestion);
-  const [manual, setManual] = useState(!saved?.server && !suggestion);
+  // A saved browser node (ytp-browser-1 …) is never the server; ignore it.
+  const savedServer = saved?.server && !isBrowserNode(saved.server) ? saved.server : "";
+  const [server, setServer] = useState(savedServer || suggestion);
+  const [manual, setManual] = useState(!savedServer && !suggestion);
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const autoTried = useRef(false);
@@ -39,6 +42,13 @@ export default function TailnetSetup({ onSaved }: { onSaved?: () => void }) {
   const running = ts.phase === "running";
   const busy = ts.phase === "loading" || ts.phase === "starting";
   const serverPeer = ts.peers.find((p) => isServerPeer(p, known));
+  // Without a known address, a device named like the server's default ("ytp") is the best guess.
+  const guessPeer = serverPeer ?? ts.peers.find((p) => /^ytp(-\d+)?$/i.test(shortName(p.name)));
+
+  useEffect(() => {
+    if (guessPeer && (!server.trim() || isBrowserNode(server))) setServer(`http://${shortName(guessPeer.name)}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [guessPeer]);
 
   const signIn = async () => {
     setError(null);
@@ -54,6 +64,26 @@ export default function TailnetSetup({ onSaved }: { onSaved?: () => void }) {
     if (!url) return;
     if (isLoopbackUrl(url)) {
       setError(`${url} is a loopback address — over the tailnet it would point at this browser, not your server.`);
+      setManual(true);
+      return;
+    }
+    if (isBrowserNode(url)) {
+      setError(
+        `${shortName(new URL(url).hostname)} is a browser running this app, not the server. Pick the device your ytp server runs on${
+          guessPeer ? ` (probably ${shortName(guessPeer.name)})` : ""
+        }.`,
+      );
+      setManual(true);
+      return;
+    }
+    const host = new URL(url).hostname.toLowerCase();
+    const peer = ts.peers.find(
+      (p) => shortName(p.name).toLowerCase() === host || p.name.replace(/\.$/, "").toLowerCase() === host || p.addresses?.includes(host),
+    );
+    if (peer && !peer.online) {
+      setError(
+        `${shortName(peer.name)} is offline on your tailnet. Make sure the ytp server is running and that its Tailscale node is signed in (Settings → Server on Tailscale, opened from the server's own address).`,
+      );
       setManual(true);
       return;
     }
@@ -174,7 +204,9 @@ function isServerPeer(p: Peer, known: KnownServer | null) {
 
 function PeerPicker({ peers, serverPeer, onPick }: { peers: Peer[]; serverPeer?: Peer; onPick: (p: Peer) => void }) {
   if (!peers.length) return null;
-  const sorted = serverPeer ? [serverPeer, ...peers.filter((p) => p !== serverPeer)] : peers;
+  // Known server first, browsers running this app last (they can't be the server).
+  const rank = (p: Peer) => (p === serverPeer ? 0 : isBrowserNode(p.name) ? 2 : 1);
+  const sorted = [...peers].sort((a, b) => rank(a) - rank(b));
   return (
     <div className="peer-list">
       <span className="muted small">Devices on your tailnet:</span>
@@ -183,6 +215,7 @@ function PeerPicker({ peers, serverPeer, onPick }: { peers: Peer[]; serverPeer?:
           <span className={`dot ${p.online ? "ok" : "off"}`} />
           {shortName(p.name)}
           {p === serverPeer && <span className="badge youtube">ytp server</span>}
+          {isBrowserNode(p.name) && <span className="muted small">· browser, not a server</span>}
           <span className="muted small">{p.addresses?.[0]}</span>
         </button>
       ))}

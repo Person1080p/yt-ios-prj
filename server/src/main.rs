@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         .pool_idle_timeout(Duration::from_secs(60))
         .build()?;
 
+    services::ytlog::init(&cfg.data_dir, db.get_bool(services::ytlog::PREF, false).await);
+
     let (events, _) = broadcast::channel(256);
     let state = Arc::new(AppState {
         yt: YtMusic::new(http.clone(), db.clone()),
@@ -47,6 +49,8 @@ async fn main() -> anyhow::Result<()> {
         db,
         cfg: cfg.clone(),
     });
+
+    state.yt.set_pace(&routes::settings::import_pace(&state).await);
 
     // Make sure yt-dlp is available before the first play request (downloads it if needed).
     {

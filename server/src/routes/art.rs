@@ -53,7 +53,21 @@ pub async fn art(State(st): State<SharedState>, Query(q): Query<ArtQuery>) -> Re
         return Ok(image_response(bytes));
     }
 
-    let resp = st.http.get(url).send().await?;
+    let yt = !host.contains("last");
+    let timer = yt.then(|| crate::services::ytlog::start("art", "image", url.path().chars().take(60).collect::<String>()));
+    let resp = match st.http.get(url).timeout(std::time::Duration::from_secs(20)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            if let Some(t) = timer {
+                t.done(if e.is_timeout() { "timeout" } else { "network-error" }, None, 1, Some(e.to_string()));
+            }
+            return Err(e.into());
+        }
+    };
+    if let Some(t) = timer {
+        let ok = resp.status().is_success();
+        t.done(if ok { "ok" } else { "http-error" }, Some(resp.status().as_u16()), 1, None);
+    }
     if !resp.status().is_success() {
         return Ok((StatusCode::BAD_GATEWAY, "artwork unavailable").into_response());
     }

@@ -17,6 +17,7 @@ const PROVIDERS: Record<string, string> = {
   demus: "Demus",
   file: "File",
   rematch: "Retry unmatched",
+  "lastfm-sync": "Last.fm two-way sync",
 };
 
 function JobRow({ job }: { job: ImportJob }) {
@@ -34,6 +35,7 @@ function JobRow({ job }: { job: ImportJob }) {
           <div style={{ width: `${pct}%` }} />
         </div>
       )}
+      {job.note && <div className="muted small">{job.note}</div>}
       {job.error && <div className="error small">{job.error}</div>}
     </div>
   );
@@ -66,6 +68,25 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
         Tracks from other services are matched to YouTube Music automatically. Plex copies are used for playback when
         available.
       </p>
+      {status && (
+        <label className="field">
+          <span className="small muted">
+            Matching speed — slower means fewer refusals from YouTube (it pauses and retries when they happen)
+          </span>
+          <select
+            className="input"
+            value={status.prefs.importPace}
+            onChange={(e) =>
+              api.setPrefs({ ...status.prefs, importPace: e.target.value as typeof status.prefs.importPace }).then(onStarted)
+            }
+          >
+            <option value="original">Original · no spacing, no retries (fastest; refused songs are marked to retry)</option>
+            <option value="normal">Normal · about 4 s per song (~3 h for 2,700)</option>
+            <option value="slow">Slow · about 8 s per song (~6 h for 2,700)</option>
+            <option value="very_slow">Very slow · about 16 s per song (~12 h for 2,700)</option>
+          </select>
+        </label>
+      )}
 
       <div className="import-row">
         <div>
@@ -117,18 +138,42 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
               {status?.lastfm.connected ? `Connected as ${status.lastfm.username}` : "Connect Last.fm in Settings first"}
             </div>
           </div>
-          <button className="btn" disabled={!status?.lastfm.connected} onClick={() => run(api.library.importLastfm(), "Last.fm")}>
-            Import
-          </button>
+          <div className="row gap">
+            <button
+              className="btn ghost"
+              disabled={!status?.lastfm.connected}
+              onClick={() => run(api.library.importLastfm(), "Last.fm")}
+              title="Add loved tracks to the library (one way)"
+            >
+              Import
+            </button>
+            <button
+              className="btn"
+              disabled={!status?.lastfm.connected}
+              onClick={() =>
+                confirm(
+                  "Two-way sync: every library song not yet loved on Last.fm gets loved, and loved tracks not in the library are added.\n\nAfter this first sync, removing a song on one side removes it on the other.",
+                ) && run(api.library.syncLastfm(), "Last.fm sync")
+              }
+            >
+              Sync both ways
+            </button>
+          </div>
         </div>
         {status?.lastfm.connected && (
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={!!status.prefs.syncLastfmLoves}
-              onChange={(e) => api.setPrefs({ ...status.prefs, syncLastfmLoves: e.target.checked }).then(onStarted)}
-            />
-            <span>Keep in sync daily (loves are added, un-loves removed)</span>
+          <label className="field">
+            <span className="small muted">Every day</span>
+            <select
+              className="input"
+              value={status.prefs.lastfmSync}
+              onChange={(e) =>
+                api.setPrefs({ ...status.prefs, lastfmSync: e.target.value as typeof status.prefs.lastfmSync }).then(onStarted)
+              }
+            >
+              <option value="off">Don't sync</option>
+              <option value="pull">Add new loves to the library (un-loves removed)</option>
+              <option value="both">Two-way: library ↔ loved tracks</option>
+            </select>
           </label>
         )}
       </div>

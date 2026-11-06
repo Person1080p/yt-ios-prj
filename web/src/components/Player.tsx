@@ -1,11 +1,12 @@
 import { useNavigate } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, fmtTime, type Track } from "../lib/api";
 import { setLiked, useLibrary } from "../lib/library";
 import { next, playRadio, previous, seek, toggle } from "../lib/player";
 import { currentTrack, useStore } from "../lib/store";
 import { ChevronDown, HeartFilledIcon, HeartIcon, MoreIcon, NextIcon, PauseIcon, PlayIcon, PrevIcon, QueueIcon, RadioIcon } from "./Icons";
-import { Cover } from "./TrackRow";
+import { artUrl, Cover } from "./TrackRow";
+import { artistLink } from "./Shelf";
 
 /** ♥: filled when the track is in your library or loved on Last.fm; toggles both. */
 export function HeartButton({ track, size = 22 }: { track: Track; size?: number }) {
@@ -44,35 +45,98 @@ export function HeartButton({ track, size = 22 }: { track: Track; size?: number 
 
 function SourceBadge() {
   const source = useStore((s) => s.source);
+  const kbps = useStore((s) => s.streamKbps);
+  const budget = useStore((s) => s.qualityBudget);
   if (!source) return null;
-  return <span className={`badge ${source}`}>{source === "plex" ? "Plex" : "YouTube"}</span>;
+  const name = source === "plex" ? "Plex" : "YouTube";
+  // Show the bitrate when quality is being limited for the connection.
+  return (
+    <span className={`badge ${source}`} title={kbps ? `${kbps} kbps` : undefined}>
+      {name}
+      {budget != null && kbps ? ` · ${kbps} kbps` : ""}
+    </span>
+  );
+}
+
+/** Loaded parts of the track, drawn in gray behind the progress. */
+function BufferedRanges({ duration }: { duration: number }) {
+  const buffered = useStore((s) => s.buffered);
+  if (!duration) return null;
+  return (
+    <>
+      {buffered.map(([a, b], i) => (
+        <div
+          key={i}
+          className="seek-buffered"
+          style={{ left: `${(Math.min(a, duration) / duration) * 100}%`, width: `${((Math.min(b, duration) - Math.min(a, duration)) / duration) * 100}%` }}
+        />
+      ))}
+    </>
+  );
 }
 
 function Seekbar({ big = false }: { big?: boolean }) {
   const position = useStore((s) => s.position);
   const duration = useStore((s) => s.duration);
-  const pct = duration ? (position / duration) * 100 : 0;
+  // While dragging, show where you are without seeking on every move (seek on release).
+  const [drag, setDrag] = useState<number | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const shown = drag ?? position;
+  const pct = duration ? Math.min(100, (shown / duration) * 100) : 0;
   if (!big) {
     return (
       <div className="mini-progress">
-        <div style={{ width: `${pct}%` }} />
+        <BufferedRanges duration={duration} />
+        <div className="mini-progress-fill" style={{ width: `${pct}%` }} />
       </div>
     );
   }
+  const timeAt = (clientX: number) => {
+    const r = ref.current!.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (clientX - r.left) / r.width)) * duration;
+  };
   return (
     <div className="seek">
-      <input
-        type="range"
-        min={0}
-        max={duration || 1}
-        step={0.5}
-        value={position}
-        onChange={(e) => seek(Number(e.target.value))}
-        style={{ ["--pct" as string]: `${pct}%` }}
+      <div
+        ref={ref}
+        className={`seek-hit ${drag != null ? "dragging" : ""}`}
+        role="slider"
+        tabIndex={0}
         aria-label="Seek"
-      />
+        aria-valuemin={0}
+        aria-valuemax={Math.round(duration)}
+        aria-valuenow={Math.round(shown)}
+        aria-valuetext={`${fmtTime(shown)} of ${fmtTime(duration)}`}
+        onPointerDown={(e) => {
+          if (!duration || e.button !== 0) return;
+          e.preventDefault(); // no text selection, no focus jump
+          e.currentTarget.setPointerCapture(e.pointerId);
+          setDrag(timeAt(e.clientX));
+        }}
+        onPointerMove={(e) => drag != null && setDrag(timeAt(e.clientX))}
+        onPointerUp={(e) => {
+          if (drag == null) return;
+          seek(timeAt(e.clientX));
+          setDrag(null);
+        }}
+        onPointerCancel={() => setDrag(null)}
+        onKeyDown={(e) => {
+          const step = { ArrowLeft: -5, ArrowRight: 5, ArrowDown: -10, ArrowUp: 10 }[e.key];
+          if (step) seek(position + step);
+          else if (e.key === "Home") seek(0);
+          else if (e.key === "End") seek(duration);
+          else return;
+          e.preventDefault();
+        }}
+      >
+        <div className="seek-track">
+          <BufferedRanges duration={duration} />
+          <div className="seek-fill" style={{ width: `${pct}%` }} />
+          <div className="seek-thumb" style={{ left: `${pct}%` }} />
+        </div>
+      </div>
       <div className="seek-times">
-        <span>{fmtTime(position)}</span>
+        <span>{fmtTime(shown)}</span>
         <span>{fmtTime(duration)}</span>
       </div>
     </div>
@@ -129,7 +193,10 @@ export function NowPlaying() {
 
   return (
     <div className="now-playing">
-      <div className="np-bg" style={{ backgroundImage: track.thumbnail ? `url(${track.thumbnail})` : undefined }} />
+      <div
+        className="np-bg"
+        style={track.thumbnail ? ({ "--np-art": `url("${artUrl(track.thumbnail)}")` } as React.CSSProperties) : undefined}
+      />
       <header className="np-header">
         <button className="icon-btn" onClick={() => setOpen(false)} aria-label="Close">
           <ChevronDown size={28} />
@@ -145,7 +212,16 @@ export function NowPlaying() {
       <div className="np-meta">
         <h2>{track.title}</h2>
         <p>
-          {track.artist}
+          <button
+            className="link-btn"
+            onClick={() => {
+              setOpen(false);
+              nav(artistLink(track.artist));
+            }}
+            title="Go to artist"
+          >
+            {track.artist}
+          </button>
           {track.album ? ` · ${track.album}` : ""}
         </p>
         <SourceBadge />

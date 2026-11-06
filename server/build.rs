@@ -20,7 +20,7 @@ fn main() {
 /// library and link it in, so the server can join the tailnet without Tailscale installed.
 fn build_tsnet() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let go = env::var("YTP_GO").unwrap_or_else(|_| "go".into());
+    let go = env::var("YTP_GO").unwrap_or_else(|_| find_go());
     let lib = out.join("libytpts.a");
 
     let status = Command::new(&go)
@@ -55,4 +55,19 @@ fn build_tsnet() {
         }
         _ => {}
     }
+}
+
+/// `go` from PATH, or from the usual install locations (a fresh shell often lacks them on PATH).
+fn find_go() -> String {
+    let on_path = env::var_os("PATH")
+        .map(|p| env::split_paths(&p).any(|d| d.join("go").is_file()))
+        .unwrap_or(false);
+    if on_path {
+        return "go".into();
+    }
+    let home = env::var("HOME").unwrap_or_default();
+    [format!("{home}/.local/go/bin/go"), "/usr/local/go/bin/go".into(), format!("{home}/go/bin/go"), "/usr/lib/go/bin/go".into()]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .unwrap_or_else(|| "go".into())
 }

@@ -8,6 +8,14 @@ type State = {
   position: number;
   duration: number;
   source: "plex" | "youtube" | null;
+  /** Loaded parts of the current track, in seconds. */
+  buffered: [number, number][];
+  /** Bitrate (kbps) of the current track's stream, when known. */
+  streamKbps: number | null;
+  /** Bitrate budget new streams are requested with (null: no limit). See quality.ts. */
+  qualityBudget: number | null;
+  /** Measured speed of the connection to the server (kbps), once measured. */
+  netKbps: number | null;
   nowPlayingOpen: boolean;
   menuTrack: Track | null;
   playlistPickerTracks: Track[] | null;
@@ -28,6 +36,10 @@ export const useStore = create<State>((set, get) => ({
   position: 0,
   duration: 0,
   source: null,
+  buffered: [],
+  streamKbps: null,
+  qualityBudget: null,
+  netKbps: null,
   nowPlayingOpen: false,
   menuTrack: null,
   playlistPickerTracks: null,

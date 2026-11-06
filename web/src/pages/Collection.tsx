@@ -5,6 +5,7 @@ import { enqueue, playTracks } from "../lib/player";
 import { useStore } from "../lib/store";
 import { BackIcon, ListIcon, PlayIcon, QueueIcon, ShuffleIcon } from "../components/Icons";
 import { Cover, TrackList } from "../components/TrackRow";
+import { artistLink } from "../components/Shelf";
 
 function shuffled<T>(a: T[]) {
   const b = [...a];
@@ -42,6 +43,11 @@ export default function Collection() {
         <Cover src={tracks?.[0]?.thumbnail} size={120} />
         <div>
           <h1>{title}</h1>
+          {id.startsWith("MPRE") && tracks?.[0]?.artist && (
+            <button className="link-btn" onClick={() => nav(artistLink(tracks[0].artist))}>
+              {tracks[0].artist}
+            </button>
+          )}
           <p className="muted">{tracks ? `${tracks.length} tracks` : "Loading…"}</p>
         </div>
       </div>

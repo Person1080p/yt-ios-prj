@@ -90,6 +90,7 @@ pub struct Job {
     done: i64,
     matched: i64,
     error: Option<String>,
+    note: Option<String>,
     started_at: i64,
     finished_at: Option<i64>,
 }
@@ -99,7 +100,7 @@ pub async fn jobs(State(st): State<SharedState>) -> ApiResult<Vec<Job>> {
         .db
         .call(|c| {
             let mut stmt = c.prepare(
-                "SELECT id,provider,status,total,done,matched,error,started_at,finished_at FROM import_jobs ORDER BY id DESC LIMIT 20",
+                "SELECT id,provider,status,total,done,matched,error,started_at,finished_at,note FROM import_jobs ORDER BY id DESC LIMIT 20",
             )?;
             let rows = stmt.query_map([], |r| {
                 Ok(Job {
@@ -112,6 +113,7 @@ pub async fn jobs(State(st): State<SharedState>) -> ApiResult<Vec<Job>> {
                     error: r.get(6)?,
                     started_at: r.get(7)?,
                     finished_at: r.get(8)?,
+                    note: r.get(9)?,
                 })
             })?;
             rows.collect()
@@ -335,6 +337,15 @@ pub async fn import_lastfm(State(st): State<SharedState>) -> ApiResult<JobStarte
         return Err(AppError::NotConfigured("Connect Last.fm in Settings first".into()));
     }
     let job_id = importers::start(st.clone(), "lastfm", importers::lastfm_loved(st.clone())).await?;
+    Ok(Json(JobStarted { job_id }))
+}
+
+/// Two-way sync now: library songs get loved on Last.fm and loved tracks join the library.
+pub async fn sync_lastfm(State(st): State<SharedState>) -> ApiResult<JobStarted> {
+    if st.lastfm.session().await.is_none() {
+        return Err(AppError::NotConfigured("Connect Last.fm in Settings first".into()));
+    }
+    let job_id = importers::start_lastfm_two_way(st.clone()).await?;
     Ok(Json(JobStarted { job_id }))
 }
 

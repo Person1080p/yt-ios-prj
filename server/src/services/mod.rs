@@ -12,4 +12,5 @@ pub mod resolver;
 pub mod tailscale;
 pub mod ytauth;
 pub mod ytdlp;
+pub mod ytlog;
 pub mod ytmusic;

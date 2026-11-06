@@ -85,8 +85,21 @@ fn song_item(t: Track) -> HomeItem {
 }
 
 /// Personal shelves for the home screen built from local history and Last.fm.
+///
+/// Building them takes a YouTube radio plus a search for every Last.fm suggestion, so the
+/// result is kept for an hour per last-played song: opening Home again costs nothing until you
+/// play something new.
 pub async fn discover(state: &AppState) -> anyhow::Result<Vec<Shelf>> {
     let recent = state.db.recent_video_ids(50).await?;
+    let profile = state.db.active_profile().await;
+    let lastfm = state.lastfm.session().await.is_some() as u8;
+    let seed = recent.first().cloned().unwrap_or_default();
+    // "yt:" prefix so the YouTube log shows these hits as "cache discover".
+    let key = format!("yt:{profile}:{lastfm}:discover:{seed}");
+    crate::services::cache::cached(&state.db, &key, crate::services::cache::HOUR, false, || build_discover(state, recent)).await
+}
+
+async fn build_discover(state: &AppState, recent: Vec<String>) -> anyhow::Result<Vec<Shelf>> {
     let exclude: HashSet<String> = recent.iter().cloned().collect();
     let mut shelves = Vec::new();
 

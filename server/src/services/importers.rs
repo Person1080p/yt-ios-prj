@@ -6,9 +6,11 @@ use rusqlite::params;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use std::collections::{HashMap, HashSet};
+
 use crate::{
     models::{now, ImportItem},
-    services::resolver,
+    services::{lastfm, matching, resolver},
     state::{ServerEvent, SharedState},
 };
 
@@ -29,7 +31,7 @@ where
         .await?;
 
     let provider = provider.to_string();
-    tokio::spawn(async move {
+    tokio::spawn(crate::services::ytlog::with_origin(format!("import:{provider}"), async move {
         let result = run(&state, job_id, &provider, fetch).await;
         let (status, err) = match result {
             Ok(()) => ("done", None),
@@ -48,7 +50,7 @@ where
             })
             .await;
         state.emit(ServerEvent::Import { job_id });
-    });
+    }));
     Ok(job_id)
 }
 
@@ -60,8 +62,21 @@ where
     let total = items.len() as i64;
     state.db.call(move |c| c.execute("UPDATE import_jobs SET total=?1 WHERE id=?2", params![total, job_id])).await?;
     state.emit(ServerEvent::Import { job_id });
+    process_items(state, job_id, provider, items, 0, 0).await?;
+    Ok(())
+}
 
-    let mut matched = 0i64;
+/// Match and store items. `done0`/`matched0` are progress already made by the job.
+/// Returns how many were matched.
+async fn process_items(
+    state: &SharedState,
+    job_id: i64,
+    provider: &str,
+    items: Vec<ImportItem>,
+    done0: i64,
+    matched0: i64,
+) -> anyhow::Result<i64> {
+    let mut matched = matched0;
     for (i, it) in items.into_iter().enumerate() {
         // Skip re-matching rows that were already matched by a previous import.
         let (p, pid) = (provider.to_string(), it.provider_id.clone());
@@ -82,8 +97,10 @@ where
             }
             (None, Some(v)) => Some(v),
             (None, None) => {
+                // Spacing between YouTube requests is handled by YtMusic's background pacer
+                // (or, at the original pace, by this short per-song pause).
                 let r = resolver::resolve(&state.yt, &state.db, &it.artist, &it.title, it.duration).await;
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                tokio::time::sleep(state.yt.song_gap()).await;
                 match r {
                     Ok(t) => t.map(|t| t.video_id),
                     Err(e) => {
@@ -101,7 +118,7 @@ where
             matched += 1;
         }
         let p = provider.to_string();
-        let done = i as i64 + 1;
+        let done = done0 + i as i64 + 1;
         state
             .db
             .call(move |c| {
@@ -133,7 +150,7 @@ where
             state.emit(ServerEvent::Import { job_id });
         }
     }
-    Ok(())
+    Ok(matched - matched0)
 }
 
 /// Make sure a track row exists for an item that already carries a YouTube id.
@@ -178,7 +195,7 @@ pub async fn start_rematch(state: SharedState) -> anyhow::Result<i64> {
             Ok(c.last_insert_rowid())
         })
         .await?;
-    tokio::spawn(async move {
+    tokio::spawn(crate::services::ytlog::with_origin("import:rematch", async move {
         let res = rematch(&state, job_id).await;
         let (status, err) = match res {
             Ok(()) => ("done", None),
@@ -191,7 +208,7 @@ pub async fn start_rematch(state: SharedState) -> anyhow::Result<i64> {
             })
             .await;
         state.emit(ServerEvent::Import { job_id });
-    });
+    }));
     Ok(job_id)
 }
 
@@ -230,30 +247,67 @@ async fn rematch(state: &SharedState, job_id: i64) -> anyhow::Result<()> {
         if done % 10 == 0 {
             state.emit(ServerEvent::Import { job_id });
         }
-        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        tokio::time::sleep(state.yt.song_gap()).await;
     }
     Ok(())
 }
 
 // ---- Last.fm loved tracks ---------------------------------------------------------------
 
+/// Legacy on/off pref for the daily one-way import (still read as a fallback).
 pub const LASTFM_SYNC_PREF: &str = "prefs.lastfm_sync_loves";
+/// "off" | "pull" (loves → library) | "both" (library ↔ loves)
+pub const LASTFM_SYNC_MODE: &str = "prefs.lastfm_sync_mode";
 
+pub async fn lastfm_sync_mode(db: &crate::db::Db) -> String {
+    match db.get_setting(LASTFM_SYNC_MODE).await.ok().flatten() {
+        Some(m) if ["off", "pull", "both"].contains(&m.as_str()) => m,
+        _ => if db.get_bool(LASTFM_SYNC_PREF, false).await { "pull".into() } else { "off".into() },
+    }
+}
+
+/// Song identity for comparing the library with Last.fm: "primary artist|title", normalized.
+pub fn love_key(artist: &str, title: &str) -> String {
+    format!("{}|{}", matching::primary_artist(artist), matching::normalize(title))
+}
+
+fn lastfm_item(artist: String, title: String) -> ImportItem {
+    ImportItem {
+        provider_id: format!("{}|{}", artist.to_lowercase(), title.to_lowercase()),
+        title,
+        artist,
+        album: None,
+        duration: None,
+        video_id: None,
+    }
+}
+
+/// (id, provider, artist, title) of every library entry.
+async fn library_rows(state: &SharedState) -> anyhow::Result<Vec<(i64, String, String, String)>> {
+    state
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT id, provider, artist, title FROM liked")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect()
+        })
+        .await
+}
+
+/// One-way import of loved tracks (loves → library). Songs already in the library from
+/// another source are skipped; Last.fm entries that were un-loved are removed.
 pub async fn lastfm_loved(state: SharedState) -> anyhow::Result<Vec<ImportItem>> {
     let loved = state.lastfm.loved_tracks().await?;
+    let lib = library_rows(&state).await?;
+    let elsewhere: HashSet<String> =
+        lib.iter().filter(|(_, p, _, _)| p != "lastfm").map(|(_, _, a, t)| love_key(a, t)).collect();
     let items: Vec<ImportItem> = loved
         .into_iter()
-        .map(|(artist, title)| ImportItem {
-            provider_id: format!("{}|{}", artist.to_lowercase(), title.to_lowercase()),
-            title,
-            artist,
-            album: None,
-            duration: None,
-            video_id: None,
-        })
+        .filter(|(a, t)| !elsewhere.contains(&love_key(a, t)))
+        .map(|(a, t)| lastfm_item(a, t))
         .collect();
     // Mirror un-loves: drop Last.fm entries that are no longer loved.
-    let keep: std::collections::HashSet<String> = items.iter().map(|i| i.provider_id.clone()).collect();
+    let keep: HashSet<String> = items.iter().map(|i| i.provider_id.clone()).collect();
     let existing: Vec<(i64, String)> = state
         .db
         .call(|c| {
@@ -265,27 +319,289 @@ pub async fn lastfm_loved(state: SharedState) -> anyhow::Result<Vec<ImportItem>>
     let gone: Vec<i64> = existing.into_iter().filter(|(_, pid)| !keep.contains(pid)).map(|(id, _)| id).collect();
     if !gone.is_empty() {
         let n = gone.len();
-        state
-            .db
-            .call(move |c| {
-                for id in gone {
-                    c.execute("DELETE FROM liked WHERE id=?1", [id])?;
-                }
-                Ok(())
-            })
-            .await?;
+        delete_rows(&state, gone).await?;
         tracing::info!("removed {n} tracks no longer loved on Last.fm");
     }
     Ok(items)
 }
 
-/// Daily Last.fm loves sync, when enabled.
+async fn delete_rows(state: &SharedState, ids: Vec<i64>) -> anyhow::Result<()> {
+    state
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            for id in ids {
+                tx.execute("DELETE FROM liked WHERE id=?1", [id])?;
+            }
+            tx.commit()
+        })
+        .await
+}
+
+/// What a two-way sync is going to do (computed before touching anything).
+#[derive(Default, Debug, PartialEq)]
+pub struct SyncPlan {
+    /// Library songs to love on Last.fm: (key, artist, title)
+    pub love: Vec<(String, String, String)>,
+    /// Songs removed from the library since the last sync → un-love on Last.fm.
+    pub unlove: Vec<(String, String, String)>,
+    /// Songs un-loved on Last.fm since the last sync → remove from the library (row ids).
+    pub remove: Vec<(String, Vec<i64>)>,
+    /// New Last.fm loves → add to the library.
+    pub add: Vec<(String, String, String)>,
+    /// Keys present on both sides (kept as synced, lf_seen = 1).
+    pub both: Vec<String>,
+    /// Loved by us earlier but never seen in Last.fm's list (kept, lf_seen = 0).
+    pub pending: Vec<String>,
+}
+
+/// Compare the library with Last.fm's loved list and the state saved by the previous sync.
+pub fn plan_sync(
+    lib: &[(i64, String, String, String)],
+    loved: &[(String, String)],
+    prev: &HashMap<String, bool>,
+) -> SyncPlan {
+    let mut lib_keys: HashMap<String, (Vec<i64>, String, String)> = HashMap::new();
+    for (id, _, a, t) in lib {
+        let e = lib_keys.entry(love_key(a, t)).or_insert_with(|| (vec![], a.clone(), t.clone()));
+        e.0.push(*id);
+    }
+    let mut lf_keys: HashMap<String, (String, String)> = HashMap::new();
+    for (a, t) in loved {
+        lf_keys.entry(love_key(a, t)).or_insert_with(|| (a.clone(), t.clone()));
+    }
+
+    let mut plan = SyncPlan::default();
+    // Pair near-identical spellings (Last.fm autocorrects artist names): same title, similar artist.
+    let mut by_title: HashMap<String, Vec<String>> = HashMap::new();
+    for k in lib_keys.keys().filter(|k| !lf_keys.contains_key(*k)) {
+        let title = k.split_once('|').map(|x| x.1).unwrap_or_default().to_string();
+        by_title.entry(title).or_default().push(k.clone());
+    }
+    let mut paired_lib: HashSet<String> = HashSet::new();
+    let mut paired_lf: HashSet<String> = HashSet::new();
+    for k in lf_keys.keys().filter(|k| !lib_keys.contains_key(*k)) {
+        let (artist, title) = k.split_once('|').unwrap_or((k, ""));
+        if title.is_empty() {
+            continue;
+        }
+        if let Some(cands) = by_title.get_mut(title) {
+            if let Some(pos) = cands.iter().position(|c| {
+                let ca = c.split_once('|').map(|x| x.0).unwrap_or_default();
+                matching::similarity(ca, artist) >= 0.5 || (ca.chars().count() >= 4 && artist.starts_with(&ca.chars().take(4).collect::<String>()))
+            }) {
+                let c = cands.remove(pos);
+                plan.both.push(c.clone());
+                plan.both.push(k.clone());
+                paired_lib.insert(c);
+                paired_lf.insert(k.clone());
+            }
+        }
+    }
+
+    for (k, (ids, a, t)) in &lib_keys {
+        if paired_lib.contains(k) {
+            continue;
+        }
+        if lf_keys.contains_key(k) {
+            plan.both.push(k.clone());
+            continue;
+        }
+        match prev.get(k) {
+            Some(true) => plan.remove.push((k.clone(), ids.clone())),
+            Some(false) => plan.pending.push(k.clone()),
+            None => plan.love.push((k.clone(), lastfm::first_artist(a), t.clone())),
+        }
+    }
+    for (k, (a, t)) in &lf_keys {
+        if paired_lf.contains(k) || lib_keys.contains_key(k) {
+            continue;
+        }
+        if prev.contains_key(k) {
+            plan.unlove.push((k.clone(), a.clone(), t.clone()));
+        } else {
+            plan.add.push((k.clone(), a.clone(), t.clone()));
+        }
+    }
+    plan.love.sort();
+    plan.add.sort();
+    plan
+}
+
+pub async fn start_lastfm_two_way(state: SharedState) -> anyhow::Result<i64> {
+    let job_id = state
+        .db
+        .call(|c| {
+            c.execute("INSERT INTO import_jobs(provider,status,started_at) VALUES('lastfm-sync','running',?1)", params![now()])?;
+            Ok(c.last_insert_rowid())
+        })
+        .await?;
+    tokio::spawn(crate::services::ytlog::with_origin("import:lastfm-sync", async move {
+        let res = lastfm_two_way(&state, job_id).await;
+        let (status, err) = match res {
+            Ok(()) => ("done", None),
+            Err(e) => {
+                tracing::error!("Last.fm two-way sync failed: {e:#}");
+                ("failed", Some(format!("{e:#}")))
+            }
+        };
+        let _ = state
+            .db
+            .call(move |c| {
+                c.execute("UPDATE import_jobs SET status=?1, error=?2, finished_at=?3 WHERE id=?4", params![status, err, now(), job_id])
+            })
+            .await;
+        state.emit(ServerEvent::Import { job_id });
+    }));
+    Ok(job_id)
+}
+
+async fn set_job(state: &SharedState, job_id: i64, done: i64, matched: i64, note: String) -> anyhow::Result<()> {
+    state
+        .db
+        .call(move |c| c.execute("UPDATE import_jobs SET done=?1, matched=?2, note=?3 WHERE id=?4", params![done, matched, note, job_id]))
+        .await?;
+    state.emit(ServerEvent::Import { job_id });
+    Ok(())
+}
+
+/// Library ↔ Last.fm loves. New library songs get loved, new loves get added; removing a
+/// song on one side (after it was synced) removes it on the other.
+async fn lastfm_two_way(state: &SharedState, job_id: i64) -> anyhow::Result<()> {
+    if state.lastfm.session().await.is_none() {
+        bail!("Connect Last.fm in Settings first");
+    }
+    let loved = state.lastfm.loved_tracks().await?;
+    let lib = library_rows(state).await?;
+    let prev: HashMap<String, bool> = state
+        .db
+        .call(|c| {
+            let mut st = c.prepare("SELECT key, lf_seen FROM lastfm_sync")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?;
+            rows.collect()
+        })
+        .await?;
+    let plan = plan_sync(&lib, &loved, &prev);
+
+    // Guard against a bad response wiping things out (e.g. Last.fm returns a short list).
+    let removals = plan.remove.len() + plan.unlove.len();
+    if removals > 25 && removals * 4 > prev.len() {
+        bail!(
+            "stopped: this sync would remove {} songs from your library and un-love {} on Last.fm, which looks wrong. \
+             Nothing was changed.",
+            plan.remove.len(),
+            plan.unlove.len()
+        );
+    }
+
+    let total = (plan.love.len() + plan.unlove.len() + plan.remove.len() + plan.add.len()) as i64;
+    state.db.call(move |c| c.execute("UPDATE import_jobs SET total=?1 WHERE id=?2", params![total, job_id])).await?;
+    let summary = |loved: usize, unloved: usize, removed: usize, added: usize, failed: usize| {
+        let mut s = format!("♥ {loved} on Last.fm · +{added} to library");
+        if unloved > 0 {
+            s += &format!(" · un-loved {unloved}");
+        }
+        if removed > 0 {
+            s += &format!(" · removed {removed}");
+        }
+        if failed > 0 {
+            s += &format!(" · {failed} failed");
+        }
+        s
+    };
+
+    let mut synced: Vec<(String, bool)> = plan.both.iter().map(|k| (k.clone(), true)).collect();
+    synced.extend(plan.pending.iter().map(|k| (k.clone(), false)));
+    let (mut done, mut loved_n, mut unloved_n, mut failed) = (0i64, 0usize, 0usize, 0usize);
+    let mut streak = 0;
+
+    // Last.fm allows a few calls per second; stay well under it.
+    let pace = std::time::Duration::from_millis(250);
+    for (k, a, t) in &plan.love {
+        match state.lastfm.love_by_name(a, t).await {
+            Ok(()) => {
+                loved_n += 1;
+                streak = 0;
+                synced.push((k.clone(), false));
+            }
+            Err(e) => {
+                failed += 1;
+                streak += 1;
+                tracing::warn!("Last.fm love {a} - {t}: {e:#}");
+            }
+        }
+        done += 1;
+        if streak >= 10 {
+            save_synced(state, &synced).await?;
+            bail!("Last.fm keeps refusing loves; stopped after {loved_n}");
+        }
+        if done % 10 == 0 {
+            set_job(state, job_id, done, 0, summary(loved_n, unloved_n, 0, 0, failed)).await?;
+        }
+        tokio::time::sleep(pace).await;
+    }
+    for (k, a, t) in &plan.unlove {
+        match state.lastfm.unlove_by_name(a, t).await {
+            Ok(()) => unloved_n += 1,
+            Err(e) => {
+                failed += 1;
+                // Keep it so the next sync tries again.
+                synced.push((k.clone(), true));
+                tracing::warn!("Last.fm unlove {a} - {t}: {e:#}");
+            }
+        }
+        done += 1;
+        tokio::time::sleep(pace).await;
+    }
+    let removed_n = plan.remove.len();
+    delete_rows(state, plan.remove.iter().flat_map(|(_, ids)| ids.iter().copied()).collect()).await?;
+    done += removed_n as i64;
+    set_job(state, job_id, done, 0, summary(loved_n, unloved_n, removed_n, 0, failed)).await?;
+
+    // Save before the (slow) YouTube matching, so an interruption doesn't re-love everything.
+    save_synced(state, &synced).await?;
+
+    let added_n = plan.add.len();
+    let items: Vec<ImportItem> = plan.add.iter().map(|(_, a, t)| lastfm_item(a.clone(), t.clone())).collect();
+    let matched = process_items(state, job_id, "lastfm", items, done, 0).await?;
+    synced.extend(plan.add.iter().map(|(k, _, _)| (k.clone(), true)));
+    save_synced(state, &synced).await?;
+    set_job(state, job_id, done + added_n as i64, matched, summary(loved_n, unloved_n, removed_n, added_n, failed)).await?;
+    tracing::info!("Last.fm sync: {}", summary(loved_n, unloved_n, removed_n, added_n, failed));
+    Ok(())
+}
+
+async fn save_synced(state: &SharedState, synced: &[(String, bool)]) -> anyhow::Result<()> {
+    let rows = synced.to_vec();
+    state
+        .db
+        .call(move |c| {
+            let tx = c.transaction()?;
+            tx.execute("DELETE FROM lastfm_sync", [])?;
+            for (k, seen) in rows {
+                tx.execute(
+                    "INSERT INTO lastfm_sync(key, lf_seen) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET lf_seen = MAX(lf_seen, excluded.lf_seen)",
+                    params![k, seen],
+                )?;
+            }
+            tx.commit()
+        })
+        .await
+}
+
+/// Daily Last.fm loves sync, in whichever mode is selected.
 pub fn spawn_lastfm_sync(state: SharedState) {
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         loop {
-            if state.db.get_bool(LASTFM_SYNC_PREF, false).await && state.lastfm.session().await.is_some() {
-                if let Err(e) = start(state.clone(), "lastfm", lastfm_loved(state.clone())).await {
+            if state.lastfm.session().await.is_some() {
+                let r = match lastfm_sync_mode(&state.db).await.as_str() {
+                    "pull" => start(state.clone(), "lastfm", lastfm_loved(state.clone())).await.map(|_| ()),
+                    "both" => start_lastfm_two_way(state.clone()).await.map(|_| ()),
+                    _ => Ok(()),
+                };
+                if let Err(e) = r {
                     tracing::warn!("Last.fm loves sync: {e:#}");
                 }
             }
@@ -520,6 +836,39 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].artist, "Daft Punk, Pharrell Williams");
         assert_eq!(items[0].duration, Some(248));
+    }
+
+    #[test]
+    fn two_way_plan() {
+        use super::*;
+        let lib = vec![
+            (1, "file".to_string(), "Daft Punk".to_string(), "Around the World".to_string()),
+            (2, "spotify".to_string(), "Beyonce, Jay-Z".to_string(), "Crazy in Love".to_string()),
+            (3, "file".to_string(), "Old Band".to_string(), "Unloved Song".to_string()),
+            (4, "file".to_string(), "New Band".to_string(), "Fresh Song".to_string()),
+        ];
+        let loved = vec![
+            ("Daft Punk".to_string(), "Around The World".to_string()),
+            ("Beyoncé".to_string(), "Crazy in Love (feat. JAY-Z)".to_string()),
+            ("Removed Artist".to_string(), "Removed Song".to_string()),
+            ("Lastfm Artist".to_string(), "New Love".to_string()),
+        ];
+        let mut prev = HashMap::new();
+        prev.insert(love_key("Old Band", "Unloved Song"), true);
+        prev.insert(love_key("Removed Artist", "Removed Song"), true);
+        let p = plan_sync(&lib, &loved, &prev);
+        assert_eq!(p.love.iter().map(|x| x.2.as_str()).collect::<Vec<_>>(), vec!["Fresh Song"]);
+        assert_eq!(p.add.iter().map(|x| x.2.as_str()).collect::<Vec<_>>(), vec!["New Love"]);
+        assert_eq!(p.remove.len(), 1);
+        assert_eq!(p.remove[0].1, vec![3]);
+        assert_eq!(p.unlove.len(), 1);
+        // "Beyonce" (library) and "Beyoncé" (Last.fm) are the same song.
+        assert!(p.both.contains(&love_key("Beyonce", "Crazy in Love")));
+        assert!(p.both.contains(&love_key("Daft Punk", "Around the World")));
+        // First sync ever: nothing is removed.
+        let first = plan_sync(&lib, &loved, &HashMap::new());
+        assert!(first.remove.is_empty() && first.unlove.is_empty());
+        assert_eq!(first.love.len(), 2);
     }
 
     #[test]

@@ -6,6 +6,7 @@ import { enqueue, playRadio } from "../lib/player";
 import { useStore } from "../lib/store";
 import { HeartFilledIcon, HeartIcon, ListIcon, PlayIcon, PlayNextIcon, PlusIcon, QueueIcon, RadioIcon, SearchIcon } from "./Icons";
 import { Cover } from "./TrackRow";
+import { artistLink } from "./Shelf";
 
 export function Sheet({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
   useEffect(() => {
@@ -69,10 +70,10 @@ export function TrackMenu() {
         className="sheet-item"
         onClick={act(() => {
           useStore.getState().setNowPlaying(false);
-          nav(`/search?q=${encodeURIComponent(track.artist.split(",")[0])}`);
+          nav(artistLink(track.artist));
         })}
       >
-        <SearchIcon size={20} /> More from {track.artist.split(",")[0]}
+        <SearchIcon size={20} /> Go to {track.artist.split(",")[0]}
       </button>
     </Sheet>
   );

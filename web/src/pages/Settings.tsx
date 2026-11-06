@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import QRCode from "qrcode";
-import { api, type PlexServer, type Prefs, type Status } from "../lib/api";
+import { api, type PlexServer, type Prefs, type Status, type YtLog, type YtLogWindow } from "../lib/api";
 import { useStore } from "../lib/store";
 import { tailnetLogout, useTailnet } from "../lib/tailnet";
 import {
@@ -14,6 +14,8 @@ import {
 import TailnetSetup from "../components/TailnetSetup";
 import ProfileToggle from "../components/ProfileToggle";
 import { resetFresh, useProfile } from "../lib/profile";
+import { CROSSFADE_MAX, crossfadeSupported, getCrossfade, setCrossfade } from "../lib/player";
+import { getQualityPref, setQualityPref, type QualityPref } from "../lib/quality";
 
 function Section({
   title,
@@ -446,11 +448,93 @@ function Preferences({ status, reload }: { status: Status; reload: () => void })
         <input type="checkbox" checked={p.loveOnLastfm} onChange={(e) => update({ loveOnLastfm: e.target.checked })} />
         <span>♥ also loves / un-loves the song on Last.fm</span>
       </label>
-      <label className="switch block">
-        <input type="checkbox" checked={p.syncLastfmLoves} onChange={(e) => update({ syncLastfmLoves: e.target.checked })} />
-        <span>Sync my Last.fm loved tracks into the library daily</span>
+      <label className="field">
+        <span className="small">Daily Last.fm loves sync</span>
+        <select
+          className="input"
+          value={p.lastfmSync}
+          onChange={(e) => update({ lastfmSync: e.target.value as Prefs["lastfmSync"] })}
+        >
+          <option value="off">Off</option>
+          <option value="pull">Loved tracks → library</option>
+          <option value="both">Two-way: library ↔ loved tracks</option>
+        </select>
       </label>
+      <AudioQuality />
+      <Crossfade />
     </Section>
+  );
+}
+
+/** Per-device: it's about this browser's connection to the server. */
+function AudioQuality() {
+  const [pref, setPref] = useState<QualityPref>(getQualityPref);
+  const net = useStore((s) => s.netKbps);
+  const budget = useStore((s) => s.qualityBudget);
+  const speed = net == null ? null : net >= 1000 ? `${(net / 1000).toFixed(1)} Mbps` : `${net} kbps`;
+  return (
+    <label className="field">
+      <span className="small">
+        Audio quality <span className="muted">· this device only</span>
+      </span>
+      <select
+        className="input"
+        value={pref}
+        onChange={(e) => {
+          const v = e.target.value as QualityPref;
+          setPref(v);
+          setQualityPref(v);
+        }}
+      >
+        <option value="auto">Automatic · adjusts to the connection to your server</option>
+        <option value="high">High · original quality (YouTube ~130 kbps, Plex file as-is)</option>
+        <option value="normal">Normal · about 96 kbps (YouTube ~66 kbps)</option>
+        <option value="low">Low · about 50–64 kbps, for very slow connections</option>
+      </select>
+      <span className="small muted">
+        {speed ? `Measured connection to the server: about ${speed}. ` : "The connection to the server is measured as songs load. "}
+        {pref === "auto" && (budget == null ? "Streaming at full quality." : `New songs are limited to about ${budget} kbps.`)}
+        {pref === "auto" && " A stall mid-song switches it to lower quality straight away."}
+      </span>
+    </label>
+  );
+}
+
+/** Per-device: it's this browser's audio that fades. */
+function Crossfade() {
+  const [secs, setSecs] = useState(getCrossfade);
+  if (!crossfadeSupported) {
+    return (
+      <p className="small muted">
+        Crossfade isn't available in this browser (iPhone and iPad don't let web pages change the volume). The next song
+        is still downloaded ahead of time.
+      </p>
+    );
+  }
+  return (
+    <label className="field">
+      <span className="small">
+        Crossfade between songs: <strong>{secs === 0 ? "off" : `${secs} s`}</strong>
+        <span className="muted"> · this device only</span>
+      </span>
+      <input
+        type="range"
+        className="crossfade-range"
+        min={0}
+        max={CROSSFADE_MAX}
+        step={1}
+        value={secs}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          setSecs(v);
+          setCrossfade(v);
+        }}
+      />
+      <span className="small muted">
+        The next song in the queue is loaded once the current one has finished downloading, so songs change without a pause
+        {secs > 0 ? `, and the last ${secs} s of each song fade into the next` : ""}.
+      </span>
+    </label>
   );
 }
 
@@ -506,6 +590,7 @@ function DeviceSection({ status }: { status: Status | null }) {
   const conn = useConnection((s) => s.conn);
   const fallback = useConnection((s) => s.tailnet);
   const directAvailable = useConnection((s) => s.directAvailable);
+  const pageWithoutServer = useConnection((s) => s.pageWithoutServer);
   const ready = useTransportReady();
   const tn = useTailnet();
   const toast = useStore((s) => s.toastMsg);
@@ -534,6 +619,18 @@ function DeviceSection({ status }: { status: Status | null }) {
           <>
             Connected <strong>through Tailscale</strong> — {location.host} can't reach your server from here. Switches back to
             direct automatically when it can.
+          </>
+        ) : directAvailable === false && pageWithoutServer ? (
+          <>
+            This page loads from {location.host}, but the <strong>ytp server behind it isn't answering</strong> — it's
+            probably not running.{" "}
+            {location.port === "5173" && (
+              <>
+                You're on the Vite dev server, which forwards <code>/api</code> to the ytp server (default{" "}
+                <code>127.0.0.1:8080</code>, or <code>YTP_BACKEND</code>); start it with <code>scripts/dev.sh</code> or{" "}
+                <code>cargo run</code> in <code>server/</code>.
+              </>
+            )}
           </>
         ) : directAvailable === false ? (
           <>Your server isn't reachable at {location.host} from here.</>
@@ -659,6 +756,157 @@ function System({ status, reload }: { status: Status; reload: () => void }) {
   );
 }
 
+function WindowStat({ label, w }: { label: string; w: YtLogWindow }) {
+  return (
+    <div className="log-stat">
+      <div className="muted small">{label}</div>
+      <div className="log-stat-num">{w.requests}</div>
+      <div className="small">
+        {w.requests > 0 && <>avg {w.avgMs} ms · max {(w.maxMs / 1000).toFixed(1)} s</>}
+        {w.cacheHits > 0 && <span className="muted"> · {w.cacheHits} cached</span>}
+      </div>
+      {(w.timeouts > 0 || w.rateLimited > 0 || w.errors > 0) && (
+        <div className="small error">
+          {[
+            w.timeouts && `${w.timeouts} timed out`,
+            w.rateLimited && `${w.rateLimited} rate-limited`,
+            w.errors && `${w.errors} failed`,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CountList({ title, rows }: { title: string; rows: [string, number][] }) {
+  if (!rows.length) return null;
+  return (
+    <div className="log-counts">
+      <div className="small muted">{title}</div>
+      {rows.map(([k, n]) => (
+        <div key={k} className="row between small">
+          <span className="ellipsis">{k}</span>
+          <strong>{n}</strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Diagnostics: log every request the server makes to YouTube, to spot what's calling it too often. */
+function YouTubeLog({ status, reload }: { status: Status; reload: () => void }) {
+  const toast = useStore((s) => s.toastMsg);
+  const [log, setLog] = useState<YtLog | null>(null);
+  const on = status.prefs.logYoutube;
+  const refresh = useRef(() => api.youtubeLog().then(setLog).catch(() => {})).current;
+
+  useEffect(() => {
+    refresh();
+    if (!on) return;
+    const t = setInterval(refresh, 5000);
+    return () => clearInterval(t);
+  }, [on, refresh]);
+
+  const toggle = async (enabled: boolean) => {
+    await api.setPrefs({ ...status.prefs, logYoutube: enabled });
+    reload();
+    refresh();
+  };
+  const download = async () => {
+    try {
+      const blob = await api.youtubeLogFile();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `youtube-${new Date().toISOString().slice(0, 19).replace(/:/g, "")}.log`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+    } catch (e) {
+      toast((e as Error).message);
+    }
+  };
+  const s = log?.stats;
+
+  return (
+    <Section title="YouTube request log" state={on ? "ok" : "off"}>
+      <p className="muted small">
+        Records every call the server makes to YouTube (API requests, play reports, yt-dlp, artwork), how long it took,
+        and which screen or background job caused it. Use it to see whether something is calling YouTube too often.
+      </p>
+      <label className="switch block">
+        <input type="checkbox" checked={on} onChange={(e) => toggle(e.target.checked)} />
+        <span>Log YouTube requests</span>
+      </label>
+      {log?.path && <div className="small muted">File on the server: {log.path}</div>}
+      {log && (
+        <div className="small muted">
+          {status.prefs.importPace === "original" ? (
+            <>Imports run at the original speed: no spacing between requests and no retries.</>
+          ) : (
+            <>
+              Imports and syncs space their requests ~{(log.backgroundGapMs / 1000).toFixed(1)} s apart
+              {log.backgroundGapMs > 4000 * { normal: 1, slow: 2, very_slow: 4, original: 1 }[status.prefs.importPace]
+                ? " (slowed down after YouTube refused requests)"
+                : ""}
+              .
+            </>
+          )}
+        </div>
+      )}
+
+      {s && (on || log.recent.length > 0) && (
+        <>
+          <div className="log-stats">
+            <WindowStat label="Last minute" w={s.lastMinute} />
+            <WindowStat label="Last 10 min" w={s.last10Minutes} />
+            <WindowStat label="Last hour" w={s.lastHour} />
+            <div className="log-stat">
+              <div className="muted small">Busiest minute</div>
+              <div className="log-stat-num">{s.peakPerMinute}</div>
+              <div className="small muted">requests</div>
+            </div>
+          </div>
+          <div className="log-breakdown">
+            <CountList title="By caller (last hour)" rows={s.byOrigin} />
+            <CountList title="By request (last hour)" rows={s.byEndpoint} />
+            <CountList title="Same request 3+ times (last hour)" rows={s.repeated} />
+          </div>
+
+          <details className="log-recent">
+            <summary className="small">Recent requests ({log.recent.length})</summary>
+            <div className="log-table">
+              {log.recent.map((e, i) => (
+                <div key={`${e.ts}-${i}`} className={`log-line ${["ok", "hit", "waited"].includes(e.outcome) ? "" : "bad"}`}>
+                  <span className="muted">{new Date(e.ts).toLocaleTimeString()}</span>
+                  <span>
+                    {e.kind} <strong>{e.endpoint}</strong> {e.detail && <span className="muted">{e.detail}</span>}
+                  </span>
+                  <span>
+                    {e.outcome}
+                    {e.status ? ` ${e.status}` : ""} · {e.ms} ms{e.attempt > 1 ? ` · try ${e.attempt}` : ""}
+                  </span>
+                  <span className="muted">{e.origin}</span>
+                  {e.error && <span className="error">{e.error}</span>}
+                </div>
+              ))}
+            </div>
+          </details>
+
+          <div className="row gap">
+            <button className="btn ghost" onClick={download}>
+              Download log
+            </button>
+            <button className="btn ghost" onClick={() => api.clearYoutubeLog().then(refresh)}>
+              Clear
+            </button>
+          </div>
+        </>
+      )}
+    </Section>
+  );
+}
+
 export default function Settings() {
   const ready = useTransportReady();
   const [status, setStatus] = useState<Status | null>(null);
@@ -706,6 +954,7 @@ export default function Settings() {
           <ServerSection status={status} reload={reload} />
           <DeviceSection status={status} />
           <System status={status} reload={reload} />
+          <YouTubeLog status={status} reload={reload} />
         </>
       )}
       {!ready && <p className="muted small">Account and playback settings appear here once you're connected to your server.</p>}

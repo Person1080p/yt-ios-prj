@@ -88,7 +88,7 @@ pub async fn handle(state: &SharedState, ev: PlaybackEvent) -> anyhow::Result<()
                 s.recorded = true;
                 let st = state.clone();
                 let session = s.clone();
-                tokio::spawn(async move { record_play(st, session).await });
+                crate::services::ytlog::spawn("record play", async move { record_play(st, session).await });
             }
         }
     }
@@ -151,9 +151,38 @@ async fn record_play(state: SharedState, s: PlaySession) {
     state.emit(ServerEvent::Scrobbled { video_id: vid });
 }
 
+/// Re-send YouTube history reports that failed in the last day (a few per round, oldest first).
+/// Older plays are left alone: YouTube files a report under the time it arrives, so a days-old
+/// play would show up in your history as if you'd just played it.
+async fn retry_youtube(state: &Arc<AppState>) -> anyhow::Result<()> {
+    if !state.yt.signed_in_now().await || !state.db.get_bool("prefs.report_youtube", true).await {
+        return Ok(());
+    }
+    let profile = state.db.active_profile().await;
+    if profile == crate::services::profile::FRESH {
+        return Ok(());
+    }
+    let cutoff = now() - 60 * 60 * 24;
+    let pending: Vec<(i64, String)> = state
+        .db
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, video_id FROM history WHERE yt_reported=0 AND played_at>?1 AND profile=?2 ORDER BY played_at LIMIT 10",
+            )?;
+            let rows = stmt.query_map(params![cutoff, profile], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+        .await?;
+    for (id, vid) in pending {
+        state.yt.add_history(&vid).await?;
+        state.db.call(move |c| c.execute("UPDATE history SET yt_reported=1 WHERE id=?1", [id])).await?;
+    }
+    Ok(())
+}
+
 /// Periodically retry scrobbles that failed (e.g. Last.fm down or server offline).
 pub fn spawn_retry_loop(state: SharedState) {
-    tokio::spawn(async move {
+    tokio::spawn(crate::services::ytlog::with_origin("play report retry loop", async move {
         let mut tick = tokio::time::interval(Duration::from_secs(600));
         loop {
             tick.tick().await;
@@ -161,10 +190,13 @@ pub fn spawn_retry_loop(state: SharedState) {
                 tracing::debug!("scrobble retry: {e:#}");
             }
         }
-    });
+    }));
 }
 
 async fn retry_once(state: &Arc<AppState>) -> anyhow::Result<()> {
+    if let Err(e) = retry_youtube(state).await {
+        tracing::debug!("youtube history retry: {e:#}");
+    }
     if state.lastfm.session().await.is_none() {
         return Ok(());
     }

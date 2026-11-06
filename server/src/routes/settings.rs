@@ -12,11 +12,12 @@ use crate::{
     error::{ApiResult, AppError},
     routes::base_url,
     services::{
+        importers,
         playback::{self, PlaybackEvent},
         plex::{PlexPin, PlexServer},
         tailscale::{self, TailscaleInfo},
-        ytauth,
-        ytmusic::{ACCOUNT_KEY, COOKIE_SOURCE_KEY, COOKIE_SYNCED_KEY},
+        ytauth, ytlog,
+        ytmusic::{pace_base_ms, ACCOUNT_KEY, DEFAULT_IMPORT_PACE, IMPORT_PACE_KEY, COOKIE_SOURCE_KEY, COOKIE_SYNCED_KEY},
     },
     state::SharedState,
 };
@@ -107,8 +108,32 @@ pub struct Prefs {
     report_youtube: bool,
     #[serde(default = "yes")]
     love_on_lastfm: bool,
+    /// Daily Last.fm loves sync: "off" | "pull" (loves → library) | "both" (library ↔ loves)
+    #[serde(default = "off")]
+    lastfm_sync: String,
     #[serde(default)]
-    sync_lastfm_loves: bool,
+    log_youtube: bool,
+    /// Spacing of import/sync requests to YouTube: "normal" | "slow" | "very_slow"
+    #[serde(default = "default_pace")]
+    import_pace: String,
+}
+
+fn default_pace() -> String {
+    DEFAULT_IMPORT_PACE.into()
+}
+
+pub async fn import_pace(st: &SharedState) -> String {
+    st.db
+        .get_setting(IMPORT_PACE_KEY)
+        .await
+        .ok()
+        .flatten()
+        .filter(|p| pace_base_ms(p).is_some())
+        .unwrap_or_else(default_pace)
+}
+
+fn off() -> String {
+    "off".into()
 }
 
 async fn load_prefs(st: &SharedState) -> Prefs {
@@ -117,18 +142,29 @@ async fn load_prefs(st: &SharedState) -> Prefs {
         scrobble: st.db.get_bool("prefs.scrobble", true).await,
         report_youtube: st.db.get_bool("prefs.report_youtube", true).await,
         love_on_lastfm: st.db.get_bool("prefs.love_on_lastfm", true).await,
-        sync_lastfm_loves: st.db.get_bool(crate::services::importers::LASTFM_SYNC_PREF, false).await,
+        lastfm_sync: importers::lastfm_sync_mode(&st.db).await,
+        log_youtube: ytlog::enabled(),
+        import_pace: import_pace(st).await,
     }
 }
 
 pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> ApiResult<Prefs> {
+    if pace_base_ms(&p.import_pace).is_none() {
+        return Err(AppError::bad("importPace must be original, normal, slow or very_slow"));
+    }
     st.db.set_setting("prefs.prefer_plex", if p.prefer_plex { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.scrobble", if p.scrobble { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.report_youtube", if p.report_youtube { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.love_on_lastfm", if p.love_on_lastfm { "1" } else { "0" }).await?;
-    st.db
-        .set_setting(crate::services::importers::LASTFM_SYNC_PREF, if p.sync_lastfm_loves { "1" } else { "0" })
-        .await?;
+    let mode = match p.lastfm_sync.as_str() {
+        m @ ("off" | "pull" | "both") => m,
+        _ => return Err(AppError::bad("lastfmSync must be off, pull or both")),
+    };
+    st.db.set_setting(importers::LASTFM_SYNC_MODE, mode).await?;
+    st.db.set_setting(ytlog::PREF, if p.log_youtube { "1" } else { "0" }).await?;
+    ytlog::set_enabled(p.log_youtube);
+    st.db.set_setting(IMPORT_PACE_KEY, &p.import_pace).await?;
+    st.yt.set_pace(&p.import_pace);
     Ok(Json(load_prefs(&st).await))
 }
 
@@ -264,6 +300,38 @@ pub async fn plex_disconnect(State(st): State<SharedState>) -> ApiResult<Value> 
 
 pub async fn spotify_disconnect(State(st): State<SharedState>) -> ApiResult<Value> {
     st.db.delete_settings("spotify.").await?;
+    Ok(ok())
+}
+
+// ---- YouTube request log ------------------------------------------------------------
+
+pub async fn youtube_log(State(st): State<SharedState>) -> ApiResult<Value> {
+    Ok(Json(json!({
+        "enabled": ytlog::enabled(),
+        "backgroundGapMs": st.yt.pace_gap_ms(),
+        "path": ytlog::path().map(|p| p.display().to_string()),
+        "stats": ytlog::stats(),
+        "recent": ytlog::recent(100),
+    })))
+}
+
+pub async fn youtube_log_file() -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let path = ytlog::path().ok_or(AppError::NotFound)?;
+    let mut text = tokio::fs::read_to_string(path.with_extension("log.1")).await.unwrap_or_default();
+    text += &tokio::fs::read_to_string(&path).await.unwrap_or_default();
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"youtube.log\""),
+        ],
+        text,
+    )
+        .into_response())
+}
+
+pub async fn clear_youtube_log() -> ApiResult<Value> {
+    ytlog::clear();
     Ok(ok())
 }
 

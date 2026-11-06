@@ -88,6 +88,13 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     finished_at INTEGER
 );
 
+-- Two-way Last.fm loves sync: songs that were on both sides after the last sync.
+-- lf_seen = 0 for songs we loved on Last.fm but haven't yet seen in its loved list.
+CREATE TABLE IF NOT EXISTS lastfm_sync (
+    key     TEXT PRIMARY KEY,
+    lf_seen INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_cache (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -119,6 +126,11 @@ impl Db {
                 "ALTER TABLE history ADD COLUMN profile TEXT NOT NULL DEFAULT 'main';
                  CREATE INDEX IF NOT EXISTS history_profile ON history(profile, played_at DESC);",
             )?;
+        }
+        // Migration: a human-readable summary line per import job.
+        let has_note: bool = conn.prepare("SELECT 1 FROM pragma_table_info('import_jobs') WHERE name='note'")?.exists([])?;
+        if !has_note {
+            conn.execute_batch("ALTER TABLE import_jobs ADD COLUMN note TEXT;")?;
         }
         // Jobs that were running when the process died will never finish.
         conn.execute(

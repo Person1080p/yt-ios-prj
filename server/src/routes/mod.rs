@@ -38,6 +38,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/home", get(music::home))
         .route("/discover", get(music::discover))
         .route("/search", get(music::search))
+        .route("/search/all", get(music::search_all))
+        .route("/artist/{id}", get(music::artist))
+        .route("/artist-lookup", get(music::artist_lookup))
+        .route("/browse/grid", get(music::browse_grid))
         .route("/radio/{video_id}", get(music::radio))
         .route("/playlist/{id}", get(music::playlist))
         .route("/recommendations/{video_id}", get(music::recommendations))
@@ -67,6 +71,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/library/ids", get(library::liked_ids))
         .route("/library/rematch", post(library::rematch))
         .route("/import/lastfm", post(library::import_lastfm))
+        .route("/library/sync-lastfm", post(library::sync_lastfm))
         .route("/tracks/{video_id}/liked", get(library::get_liked).put(library::set_liked))
         .route("/art", get(art::art))
         .route("/import/jobs", get(library::jobs))
@@ -84,6 +89,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/status", get(settings::status))
         .route("/prefs", put(settings::set_prefs))
         .route("/ytdlp/update", post(settings::update_ytdlp))
+        .route("/logs/youtube", get(settings::youtube_log).delete(settings::clear_youtube_log))
+        .route("/logs/youtube/file", get(settings::youtube_log_file))
         .route("/ytmusic/cookie", put(settings::set_yt_cookie).delete(settings::delete_yt_cookie))
         .route("/ytmusic/import-browser", post(settings::import_yt_browser))
         .route("/ytmusic/sync", post(settings::sync_yt_browser))
@@ -102,7 +109,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/events", get(events))
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .route("/auth/login", post(login))
-        .route("/auth/check", get(auth_check));
+        .route("/auth/check", get(auth_check))
+        .layer(middleware::from_fn(tag_origin));
 
     let web_dir = state.cfg.web_dir.clone();
     let spa = ServeDir::new(&web_dir).precompressed_gzip().fallback(ServeFile::new(web_dir.join("index.html")));
@@ -134,6 +142,17 @@ pub async fn base_url(st: &SharedState, headers: &HeaderMap) -> String {
         if host.ends_with(".ts.net") { "https".into() } else { "http".into() }
     });
     format!("{proto}://{host}")
+}
+
+/// Attribute YouTube requests made while handling an API call to that call's route (request log).
+async fn tag_origin(req: Request, next: Next) -> Response {
+    let path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| format!("/api{}", req.uri().path()));
+    let label = format!("{} {}", req.method(), path);
+    crate::services::ytlog::with_origin(label, next.run(req)).await
 }
 
 // ---- optional shared-secret auth -------------------------------------------------

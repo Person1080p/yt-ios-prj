@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{ApiResult, AppError},
-    models::{Shelf, Track},
+    models::{ArtistPage, GridPage, SearchResults, Shelf, Track},
     services::recommend,
     state::SharedState,
 };
@@ -133,4 +133,68 @@ pub async fn history(State(st): State<SharedState>) -> ApiResult<Vec<HistoryEntr
         })
         .await?;
     Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+pub struct SearchAllQuery {
+    q: String,
+    /// artists | albums | songs (default: everything)
+    #[serde(default)]
+    filter: Option<String>,
+}
+
+/// Search across songs, artists, albums, videos and playlists (or one kind with `filter`).
+pub async fn search_all(State(st): State<SharedState>, Query(q): Query<SearchAllQuery>) -> ApiResult<SearchResults> {
+    if q.q.trim().is_empty() {
+        return Ok(Json(SearchResults::default()));
+    }
+    let res = match q.filter.as_deref() {
+        Some("songs") => SearchResults { songs: st.yt.search_songs(&q.q, 30).await?, ..Default::default() },
+        f => st.yt.search_all(&q.q, f).await?,
+    };
+    let mut tracks = res.songs.clone();
+    tracks.extend(res.top.iter().filter_map(|t| t.track.clone()));
+    st.db.upsert_tracks(tracks).await?;
+    Ok(Json(res))
+}
+
+fn valid_browse_id(id: &str) -> Result<(), AppError> {
+    if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(AppError::bad("invalid id"));
+    }
+    Ok(())
+}
+
+pub async fn artist(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<ArtistPage> {
+    valid_browse_id(&id)?;
+    let page = st.yt.artist(&id).await?;
+    st.db.upsert_tracks(page.top_songs.clone()).await?;
+    Ok(Json(page))
+}
+
+#[derive(Deserialize)]
+pub struct ArtistLookup {
+    name: String,
+}
+
+/// The artist page id for a name: `{ "id": "UC…" }` or `{ "id": null }`.
+pub async fn artist_lookup(State(st): State<SharedState>, Query(q): Query<ArtistLookup>) -> ApiResult<serde_json::Value> {
+    let name = q.name.trim();
+    if name.is_empty() {
+        return Err(AppError::bad("name required"));
+    }
+    Ok(Json(serde_json::json!({ "id": st.yt.artist_id_for(name).await? })))
+}
+
+#[derive(Deserialize)]
+pub struct GridQuery {
+    id: String,
+    #[serde(default)]
+    params: Option<String>,
+}
+
+/// A grid page, e.g. an artist's full discography (the "See all" of Albums / Singles).
+pub async fn browse_grid(State(st): State<SharedState>, Query(q): Query<GridQuery>) -> ApiResult<GridPage> {
+    valid_browse_id(&q.id)?;
+    Ok(Json(st.yt.browse_grid(&q.id, q.params.as_deref()).await?))
 }

@@ -104,7 +104,13 @@ impl LastFm {
         p.insert("format".into(), "json".into());
 
         let req = if signed { self.http.post(API).form(&p) } else { self.http.get(API).query(&p) };
-        let v: Value = req.header("user-agent", "ytp/0.1").send().await?.json().await?;
+        let v: Value = req
+            .header("user-agent", "ytp/0.1")
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(code) = v["error"].as_i64() {
             bail!("last.fm {method} error {code}: {}", v["message"].as_str().unwrap_or_default());
         }
@@ -138,7 +144,17 @@ impl LastFm {
     }
 
     pub async fn unlove(&self, t: &Track) -> anyhow::Result<()> {
-        self.call("track.unlove", vec![("artist", first_artist(&t.artist)), ("track", t.title.clone())], true, true)
+        self.unlove_by_name(&first_artist(&t.artist), &t.title).await
+    }
+
+    pub async fn unlove_by_name(&self, artist: &str, title: &str) -> anyhow::Result<()> {
+        self.call("track.unlove", vec![("artist", artist.to_string()), ("track", title.to_string())], true, true)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn love_by_name(&self, artist: &str, title: &str) -> anyhow::Result<()> {
+        self.call("track.love", vec![("artist", artist.to_string()), ("track", title.to_string())], true, true)
             .await
             .map(|_| ())
     }
@@ -191,9 +207,7 @@ impl LastFm {
     }
 
     pub async fn love(&self, t: &Track) -> anyhow::Result<()> {
-        self.call("track.love", vec![("artist", first_artist(&t.artist)), ("track", t.title.clone())], true, true)
-            .await
-            .map(|_| ())
+        self.love_by_name(&first_artist(&t.artist), &t.title).await
     }
 
     pub async fn similar_tracks(&self, artist: &str, title: &str, limit: u32) -> anyhow::Result<Vec<Similar>> {
@@ -264,6 +278,6 @@ impl LastFm {
     }
 }
 
-fn first_artist(s: &str) -> String {
+pub fn first_artist(s: &str) -> String {
     s.split(", ").next().unwrap_or(s).trim().to_string()
 }

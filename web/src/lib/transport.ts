@@ -69,6 +69,11 @@ type ConnState = {
   tailnet: TailnetConfig | null;
   /** Result of the last check of the page's own address (null = not checked yet). */
   directAvailable: boolean | null;
+  /**
+   * The page's own address answered, but its /api isn't a ytp server — e.g. the Vite dev
+   * server is running but the ytp server it forwards to isn't. Tailscale can't fix that.
+   */
+  pageWithoutServer: boolean;
   knownServer: KnownServer | null;
 };
 
@@ -76,6 +81,7 @@ export const useConnection = create<ConnState>(() => ({
   conn: null,
   tailnet: readTailnetConfig(),
   directAvailable: null,
+  pageWithoutServer: false,
   knownServer: readKnownServer(),
 }));
 const set = useConnection.setState;
@@ -102,10 +108,12 @@ async function probeDirect(): Promise<boolean> {
   const t = setTimeout(() => ctrl.abort(), PROBE_TIMEOUT_MS);
   try {
     const r = await fetch("/api/auth/check", { cache: "no-store", signal: ctrl.signal });
-    if (!r.ok || !(r.headers.get("content-type") ?? "").includes("json")) return false;
-    const j = await r.json();
-    return typeof j.required === "boolean";
+    const ok = r.ok && (r.headers.get("content-type") ?? "").includes("json") && typeof (await r.json())?.required === "boolean";
+    // Something answered at this address (it served this page), just not the ytp API.
+    set({ pageWithoutServer: !ok });
+    return ok;
   } catch {
+    set({ pageWithoutServer: false });
     return false;
   } finally {
     clearTimeout(t);
@@ -163,6 +171,20 @@ export function rememberServerStatus(status: { tailscale?: { url?: string | null
     /* ignore */
   }
   set({ knownServer: known });
+}
+
+/**
+ * Tailnet nodes this app creates for browsers/phones (ytp-browser, ytp-iphone-2, …).
+ * They run the web app, never the server.
+ */
+export function isBrowserNode(nameOrUrl: string) {
+  let h = nameOrUrl.trim();
+  try {
+    if (/^https?:\/\//.test(h)) h = new URL(h).hostname;
+  } catch {
+    /* plain name */
+  }
+  return /^ytp-(browser|iphone|ipad|android)(-\d+)?(\.|$)/i.test(h);
 }
 
 /** localhost / 127.x / ::1 — over the tailnet these would mean the browser's own node, never the server. */
@@ -237,7 +259,7 @@ export function setTailnetConfig(cfg: TailnetConfig | null) {
  */
 export function suggestedTailnetServer(state: ConnState = get()): string {
   const k = state.knownServer;
-  if (k?.tailnetUrl) return k.tailnetUrl;
+  if (k?.tailnetUrl && !isBrowserNode(k.tailnetUrl)) return k.tailnetUrl;
   // The page's own address only helps if the tailnet can reach it (not localhost).
   const origin = k?.origin ?? (state.directAvailable ? location.origin : "");
   return origin && !isLoopbackUrl(origin) ? origin : "";

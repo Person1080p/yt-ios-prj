@@ -1,71 +1,9 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { api, isNotConnected, type HomeItem, type Shelf } from "../lib/api";
-import { playRadio, playTracks } from "../lib/player";
-import { useStore } from "../lib/store";
-import { PlayIcon } from "../components/Icons";
-import { Cover } from "../components/TrackRow";
+import { Link } from "react-router-dom";
+import { api, isNotConnected, type Shelf } from "../lib/api";
+import { ShelfView } from "../components/Shelf";
 import ProfileToggle from "../components/ProfileToggle";
 import { useProfile } from "../lib/profile";
-
-function ShelfView({ shelf }: { shelf: Shelf }) {
-  const nav = useNavigate();
-  const openMenu = useStore((s) => s.openMenu);
-  const songs = shelf.items.filter((i) => i.track);
-  const allSongs = songs.length === shelf.items.length;
-
-  const open = (item: HomeItem) => {
-    if (item.track) {
-      // Quick-pick style shelves: play the shelf in order. Single songs elsewhere start a radio.
-      if (allSongs && songs.length > 1) {
-        playTracks(
-          songs.map((s) => s.track!),
-          songs.indexOf(item),
-        );
-      } else {
-        playRadio(item.track);
-      }
-    } else if (item.kind === "artist") {
-      nav(`/search?q=${encodeURIComponent(item.title)}`);
-    } else {
-      const id = item.playlistId ?? item.browseId;
-      if (id) nav(`/collection/${encodeURIComponent(id)}?title=${encodeURIComponent(item.title)}`);
-    }
-  };
-
-  return (
-    <section className="shelf">
-      <div className="shelf-head">
-        <h2>{shelf.title}</h2>
-        {allSongs && songs.length > 1 && (
-          <button className="btn small ghost" onClick={() => playTracks(songs.map((s) => s.track!))}>
-            <PlayIcon size={14} /> Play all
-          </button>
-        )}
-      </div>
-      <div className="shelf-scroll">
-        {shelf.items.map((item, i) => (
-          <div key={i} className="card">
-            <button
-              className="card-btn"
-              onClick={() => open(item)}
-              onContextMenu={(e) => {
-                if (item.track) {
-                  e.preventDefault();
-                  openMenu(item.track);
-                }
-              }}
-            >
-              <Cover src={item.thumbnail} size={148} round={item.kind === "artist"} />
-              <div className="card-title">{item.title}</div>
-              <div className="card-sub">{item.subtitle}</div>
-            </button>
-          </div>
-        ))}
-      </div>
-    </section>
-  );
-}
 
 export default function Home() {
   const [shelves, setShelves] = useState<Shelf[] | null>(null);

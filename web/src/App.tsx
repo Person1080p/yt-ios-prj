@@ -14,6 +14,7 @@ import { PlaylistPicker, Toast, TrackMenu } from "./components/Sheets";
 import Home from "./pages/Home";
 import Search from "./pages/Search";
 import Collection from "./pages/Collection";
+import Artist, { ArtistByName, BrowseGrid } from "./pages/Artist";
 import QueuePage from "./pages/QueuePage";
 import { PlaylistDetail, PlaylistsPage } from "./pages/Playlists";
 import Library from "./pages/Library";
@@ -146,6 +147,9 @@ export default function App() {
           <Route path="/" element={<Home />} />
           <Route path="/search" element={<Search />} />
           <Route path="/collection/:id" element={<Collection />} />
+          <Route path="/artist" element={<ArtistByName />} />
+          <Route path="/artist/:id" element={<Artist />} />
+          <Route path="/browse/:id" element={<BrowseGrid />} />
           <Route path="/queue" element={<QueuePage />} />
           <Route path="/playlists" element={<PlaylistsPage />} />
           <Route path="/playlists/:id" element={<PlaylistDetail />} />

@@ -99,7 +99,7 @@ pub async fn import(state: &AppState, only: Option<&str>, keep_in_sync: bool) ->
 
 /// Periodically refresh a browser-sourced cookie from the same browser.
 pub fn spawn_sync_loop(state: SharedState) {
-    tokio::spawn(async move {
+    tokio::spawn(crate::services::ytlog::with_origin("cookie sync loop", async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
             if let Err(e) = sync_once(&state).await {
@@ -107,7 +107,7 @@ pub fn spawn_sync_loop(state: SharedState) {
             }
             tokio::time::sleep(SYNC_EVERY).await;
         }
-    });
+    }));
 }
 
 pub async fn sync_once(state: &AppState) -> anyhow::Result<bool> {

@@ -39,6 +39,61 @@ pub struct Shelf {
     pub items: Vec<HomeItem>,
 }
 
+/// Search across everything (not just songs): the best match, then results by kind.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResults {
+    pub top: Option<HomeItem>,
+    pub songs: Vec<Track>,
+    pub artists: Vec<HomeItem>,
+    pub albums: Vec<HomeItem>,
+    pub playlists: Vec<HomeItem>,
+    pub videos: Vec<Track>,
+}
+
+/// A YouTube Music page reference (e.g. an artist's full discography).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowseRef {
+    pub browse_id: String,
+    pub params: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistShelf {
+    pub title: String,
+    pub items: Vec<HomeItem>,
+    /// "See all": a grid page (discography) or a playlist.
+    pub more: Option<BrowseRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtistPage {
+    pub id: String,
+    pub name: String,
+    pub thumbnail: Option<String>,
+    pub description: Option<String>,
+    /// e.g. "205M monthly audience" / "5.46M subscribers"
+    pub stats: Option<String>,
+    /// The artist's radio (YouTube Music "Mix").
+    pub radio_playlist_id: Option<String>,
+    pub top_songs: Vec<Track>,
+    /// Playlist with all their songs ("See all" under Top songs).
+    pub songs_playlist_id: Option<String>,
+    /// Albums, Singles & EPs, Videos, Fans might also like, Featured on, …
+    pub shelves: Vec<ArtistShelf>,
+}
+
+/// A grid of albums/singles (an artist's discography).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridPage {
+    pub title: String,
+    pub items: Vec<HomeItem>,
+}
+
 /// An item coming from an external provider during an import, before it is matched to YouTube.
 #[derive(Debug, Clone)]
 pub struct ImportItem {

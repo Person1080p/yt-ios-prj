@@ -17,8 +17,8 @@ use sha1::{Digest, Sha1};
 
 use crate::{
     db::Db,
-    models::{parse_duration, HomeItem, Shelf, Track},
-    services::{cache, profile},
+    models::{parse_duration, ArtistPage, ArtistShelf, BrowseRef, GridPage, HomeItem, SearchResults, Shelf, Track},
+    services::{cache, profile, ytlog},
 };
 
 const BASE: &str = "https://music.youtube.com/youtubei/v1/";
@@ -26,6 +26,8 @@ const ORIGIN: &str = "https://music.youtube.com";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0";
 /// Search params for the "Songs" filter.
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
+const ARTISTS_FILTER: &str = "EgWKAQIgAWoSEAUQCRAKEAMQEBAEEBUQDhAR";
+const ALBUMS_FILTER: &str = "EgWKAQIYAWoSEAUQCRAKEAMQEBAEEBUQDhAR";
 pub const COOKIE_KEY: &str = "ytmusic.cookie";
 /// Where the cookie came from: "manual", or "browser:<name>" when imported (and kept in sync)
 /// from a browser on the server machine.
@@ -63,19 +65,120 @@ pub struct YtMusic {
     db: Db,
     /// When Google starts refusing us ("unusual traffic"), every request waits until this passes.
     cooldown: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    /// Consecutive "unusual traffic" refusals; the pause grows with each, and resets on success.
+    strikes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Spacing for background requests (imports, retries, syncs): one at a time, with a gap.
+    pacer: std::sync::Arc<tokio::sync::Mutex<std::time::Instant>>,
+    /// Multiplier on the gap: doubles when YouTube refuses us, eases back on success.
+    pace_factor: std::sync::Arc<std::sync::Mutex<f64>>,
+    /// Base gap between background requests (from the import pace setting).
+    pace_base_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Signature timestamp of YouTube's current player script, and when we read it.
+    sts: std::sync::Arc<tokio::sync::Mutex<Option<(u32, std::time::Instant)>>>,
 }
+
+/// Setting for how far apart background requests are: "original" | "normal" | "slow" | "very_slow".
+/// "original" is the behaviour before any rate-limit handling: no spacing between requests
+/// (just a short pause per song in the import loop), one attempt each, no retries or pauses.
+pub const IMPORT_PACE_KEY: &str = "prefs.import_pace";
+pub const DEFAULT_IMPORT_PACE: &str = "slow";
+/// Base gap for a pace setting; each request also waits a random extra of up to 60% of it.
+pub fn pace_base_ms(pace: &str) -> Option<u64> {
+    match pace {
+        "original" => Some(0),
+        "normal" => Some(3_000),
+        "slow" => Some(6_000),
+        "very_slow" => Some(12_000),
+        _ => None,
+    }
+}
+const PACE_MAX_FACTOR: f64 = 4.0;
+
+/// Pause after the 1st, 2nd, … consecutive refusal. Often a single refusal clears up within
+/// seconds, so start short.
+const BLOCK_PAUSE_SECS: [u64; 5] = [3, 15, 60, 120, 300];
+/// Someone waiting on a screen never waits longer than this for a pause to end.
+const INTERACTIVE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl YtMusic {
     pub fn new(http: reqwest::Client, db: Db) -> Self {
-        Self { http, db, cooldown: Default::default() }
+        Self {
+            http,
+            db,
+            cooldown: Default::default(),
+            strikes: Default::default(),
+            pacer: std::sync::Arc::new(tokio::sync::Mutex::new(std::time::Instant::now())),
+            pace_factor: std::sync::Arc::new(std::sync::Mutex::new(1.0)),
+            pace_base_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(pace_base_ms(DEFAULT_IMPORT_PACE).unwrap_or(6_000))),
+            sts: Default::default(),
+        }
     }
 
-    async fn wait_for_cooldown(&self) {
+    /// Apply the import pace setting ("normal" | "slow" | "very_slow").
+    pub fn set_pace(&self, pace: &str) {
+        if let Some(ms) = pace_base_ms(pace) {
+            self.pace_base_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Background work runs the way it did originally (see [`IMPORT_PACE_KEY`]).
+    pub fn original_pace(&self) -> bool {
+        self.pace_base_ms.load(std::sync::atomic::Ordering::Relaxed) == 0
+    }
+
+    /// Pause between songs in import loops: only used at the original pace, where the
+    /// per-request spacing is off.
+    pub fn song_gap(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(if self.original_pace() { 120 } else { 0 })
+    }
+
+    fn pace_base(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.pace_base_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Wait for this background request's turn. Requests go one at a time, spaced out.
+    async fn pace(&self) {
+        let mut next = self.pacer.lock().await; // held while waiting: background requests queue up
+        let now = std::time::Instant::now();
+        if *next > now {
+            tokio::time::sleep(*next - now).await;
+        }
+        let factor = *self.pace_factor.lock().unwrap_or_else(|p| p.into_inner());
+        let base = self.pace_base();
+        let jitter = base.mul_f64(0.6 * rand::thread_rng().gen::<f64>());
+        *next = std::time::Instant::now() + (base + jitter).mul_f64(factor);
+    }
+
+    fn adjust_pace(&self, refused: bool) {
+        let mut f = self.pace_factor.lock().unwrap_or_else(|p| p.into_inner());
+        let old = *f;
+        *f = if refused { (old * 2.0).min(PACE_MAX_FACTOR) } else { (old * 0.97).max(1.0) };
+        if refused && *f != old {
+            tracing::info!("slowing background YouTube requests: ~{:.1}s apart", self.pace_base().as_secs_f64() * 1.3 * *f);
+        }
+    }
+
+    /// Current spacing between background requests (for the request log), in ms.
+    pub fn pace_gap_ms(&self) -> u64 {
+        let f = *self.pace_factor.lock().unwrap_or_else(|p| p.into_inner());
+        if self.original_pace() {
+            return 120;
+        }
+        (self.pace_base().as_millis() as f64 * 1.3 * f) as u64
+    }
+
+    async fn wait_for_cooldown(&self, endpoint: &str, detail: &str) {
         let until = *self.cooldown.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(t) = until {
             let now = std::time::Instant::now();
             if t > now {
-                tokio::time::sleep(t - now).await;
+                let timer = ytlog::start("cooldown", endpoint, detail);
+                let mut wait = t - now;
+                if ytlog::is_interactive() {
+                    wait = wait.min(INTERACTIVE_MAX_WAIT);
+                }
+                tokio::time::sleep(wait).await;
+                timer.done("waited", None, 0, None);
             }
         }
     }
@@ -143,12 +246,26 @@ impl YtMusic {
         body["context"] = json!({ "client": client, "user": {} });
 
         // Bulk work (imports) can trip YouTube's rate limits: back off and retry instead of
-        // treating a refused request as "no result".
+        // treating a refused request as "no result". A screen waiting on the answer gets one
+        // quick retry and then an error (the cache serves the last good copy where it has one).
+        let detail = request_detail(&body);
+        let interactive = ytlog::is_interactive();
+        // Original pace: background requests go out immediately, once, and a refusal is just an error.
+        let original = !interactive && self.original_pace();
+        let max_blocked = if original { 0 } else if interactive { 1 } else { 4 };
+        let max_retries = if original { 0 } else if interactive { 1 } else { 4 };
         let mut attempt = 0;
         loop {
-            self.wait_for_cooldown().await;
-            match self.send_once(endpoint, &body, &creds).await {
+            if !original {
+                self.wait_for_cooldown(endpoint, &detail).await;
+            }
+            if !interactive && !original {
+                self.pace().await;
+            }
+            match self.send_once(endpoint, &body, &creds, &detail, attempt + 1).await {
                 Ok(v) => {
+                    self.strikes.store(0, std::sync::atomic::Ordering::Relaxed);
+                    self.adjust_pace(false);
                     // A new fresh-profile visitor: remember the id YouTube assigned so it stays the same listener.
                     if let Creds::Visitor(None) = creds {
                         if let Some(id) = v["responseContext"]["visitorData"].as_str() {
@@ -157,25 +274,36 @@ impl YtMusic {
                     }
                     return Ok(v);
                 }
-                Err(SendError::RateLimited(_)) if attempt < 4 => {
-                    // Google's "unusual traffic" block: pause *all* requests, increasingly long.
-                    let secs = 30 * 2u64.pow(attempt);
+                Err(SendError::RateLimited(_)) if attempt < max_blocked => {
+                    // Google's "unusual traffic" block: pause *all* requests, longer each time in a row.
+                    let n = self.strikes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.adjust_pace(true);
+                    let secs = BLOCK_PAUSE_SECS[n.min(BLOCK_PAUSE_SECS.len() - 1)];
                     tracing::warn!("YouTube is rate-limiting us ({endpoint}); pausing requests for {secs}s");
                     self.start_cooldown(secs);
                     attempt += 1;
                 }
-                Err(SendError::Retryable(e)) if attempt < 4 => {
+                Err(SendError::RateLimited(e)) => {
+                    if !original {
+                        self.strikes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.adjust_pace(true);
+                    }
+                    return Err(e);
+                }
+                // Timeouts / server errors: background jobs retry patiently, screens retry once.
+                Err(SendError::Retryable(e)) if attempt < max_retries => {
                     let wait = std::time::Duration::from_millis(1000 * 3u64.pow(attempt));
                     tracing::debug!("youtube music {endpoint}: {e:#}; retrying in {wait:?}");
                     tokio::time::sleep(wait).await;
                     attempt += 1;
                 }
-                Err(SendError::Retryable(e)) | Err(SendError::RateLimited(e)) | Err(SendError::Fatal(e)) => return Err(e),
+                Err(SendError::Retryable(e)) | Err(SendError::Fatal(e)) => return Err(e),
             }
         }
     }
 
-    async fn send_once(&self, endpoint: &str, body: &Value, creds: &Creds) -> Result<Value, SendError> {
+    async fn send_once(&self, endpoint: &str, body: &Value, creds: &Creds, detail: &str, attempt: u32) -> Result<Value, SendError> {
+        let timer = ytlog::start("innertube", endpoint, format!("{detail} [{}]", creds.label()));
         let mut req = self
             .http
             .post(format!("{BASE}{endpoint}?alt=json&prettyPrint=false"))
@@ -197,21 +325,40 @@ impl YtMusic {
             Creds::Visitor(Some(v)) => req = req.header("x-goog-visitor-id", v.clone()),
             _ => {}
         }
-        let resp = req.send().await.map_err(|e| SendError::Retryable(e.into()))?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                timer.done(if e.is_timeout() { "timeout" } else { "network-error" }, None, attempt, Some(e.to_string()));
+                return Err(SendError::Retryable(e.into()));
+            }
+        };
         let status = resp.status();
+        let code = Some(status.as_u16());
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             // Google answers bot detection with a 403/429 "Sorry…" HTML page.
             let blocked = status.as_u16() == 429 || (status.as_u16() == 403 && text.contains("Sorry"));
             if blocked {
+                timer.done("rate-limited", code, attempt, None);
                 return Err(SendError::RateLimited(anyhow!(
                     "YouTube is temporarily rate-limiting this server ({status}); try again in a few minutes"
                 )));
             }
-            let err = anyhow!("youtube music {endpoint} failed: {status} {}", text.chars().take(300).collect::<String>());
+            let snippet = text.chars().take(300).collect::<String>();
+            timer.done("http-error", code, attempt, Some(snippet.chars().take(120).collect()));
+            let err = anyhow!("youtube music {endpoint} failed: {status} {snippet}");
             return Err(if status.is_server_error() { SendError::Retryable(err) } else { SendError::Fatal(err) });
         }
-        resp.json().await.map_err(|e| SendError::Retryable(e.into()))
+        match resp.json::<Value>().await {
+            Ok(v) => {
+                timer.done("ok", code, attempt, None);
+                Ok(v)
+            }
+            Err(e) => {
+                timer.done(if e.is_timeout() { "timeout" } else { "error" }, code, attempt, Some(format!("reading body: {e}")));
+                Err(SendError::Retryable(e.into()))
+            }
+        }
     }
 
     /// Cache key scoped to who's asking (profile + signed in or not), since results are personalised.
@@ -257,6 +404,71 @@ impl YtMusic {
     pub async fn song_info(&self, video_id: &str) -> anyhow::Result<Track> {
         let key = format!("yt:song:{video_id}");
         cache::cached(&self.db, &key, 30 * cache::DAY, false, || self.fetch_song_info(video_id)).await
+    }
+
+    /// Search everything (`filter`: None, "artists" or "albums"): top result, artists, albums,
+    /// songs, videos, playlists.
+    pub async fn search_all(&self, query: &str, filter: Option<&str>) -> anyhow::Result<SearchResults> {
+        let params = match filter {
+            None => None,
+            Some("artists") => Some(ARTISTS_FILTER),
+            Some("albums") => Some(ALBUMS_FILTER),
+            Some(f) => bail!("unknown search filter {f}"),
+        };
+        let key = self.ckey("search_all", &format!("{}:{}", filter.unwrap_or("all"), query.trim().to_lowercase())).await;
+        cache::cached(&self.db, &key, 6 * cache::HOUR, false, || async move {
+            let mut body = json!({ "query": query });
+            if let Some(p) = params {
+                body["params"] = json!(p);
+            }
+            let v = self.post("search", body, true).await?;
+            Ok(parse_search(&v))
+        })
+        .await
+    }
+
+    /// An artist's page: header, top songs, albums, singles, videos, related artists…
+    pub async fn artist(&self, browse_id: &str) -> anyhow::Result<ArtistPage> {
+        let key = self.ckey("artist", browse_id).await;
+        cache::cached(&self.db, &key, 12 * cache::HOUR, false, || async move {
+            let v = self.post("browse", json!({ "browseId": browse_id }), true).await?;
+            parse_artist(&v, browse_id).context("not an artist page")
+        })
+        .await
+    }
+
+    /// A grid page such as an artist's full list of albums or singles.
+    pub async fn browse_grid(&self, browse_id: &str, params: Option<&str>) -> anyhow::Result<GridPage> {
+        let key = self.ckey("grid", &format!("{browse_id}:{}", params.unwrap_or(""))).await;
+        cache::cached(&self.db, &key, cache::DAY, false, || async move {
+            let mut body = json!({ "browseId": browse_id });
+            if let Some(p) = params {
+                body["params"] = json!(urlencoding::decode(p).map(|c| c.into_owned()).unwrap_or_else(|_| p.to_string()));
+            }
+            let v = self.post("browse", body, true).await?;
+            let mut items = Vec::new();
+            find_all(&v, "musicTwoRowItemRenderer", &mut items);
+            Ok(GridPage {
+                title: header_info(&v).title.unwrap_or_default(),
+                items: items.into_iter().filter_map(parse_two_row).collect(),
+            })
+        })
+        .await
+    }
+
+    /// The artist page id for a name (for "Go to artist" from a song, which only has the name).
+    pub async fn artist_id_for(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let found = self.search_all(name, Some("artists")).await?;
+        let want = crate::services::matching::normalize(name);
+        let ids: Vec<(String, String)> = found
+            .top
+            .iter()
+            .chain(found.artists.iter())
+            .filter(|a| a.kind == "artist")
+            .filter_map(|a| Some((crate::services::matching::normalize(&a.title), a.browse_id.clone()?)))
+            .collect();
+        // Prefer an exact name match; otherwise YouTube's first artist.
+        Ok(ids.iter().find(|(n, _)| *n == want).or(ids.first()).map(|(_, id)| id.clone()))
     }
 
     async fn fetch_search_songs(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
@@ -416,15 +628,79 @@ impl YtMusic {
     }
 
     async fn player(&self, video_id: &str) -> anyhow::Result<Value> {
-        self.post(
-            "player",
-            json!({
-                "videoId": video_id,
-                "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": 0 } }
-            }),
-            true,
-        )
-        .await
+        let body = self.player_body(video_id).await;
+        self.post("player", body, true).await
+    }
+
+    async fn player_body(&self, video_id: &str) -> Value {
+        json!({
+            "videoId": video_id,
+            "playbackContext": { "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "signatureTimestamp": self.signature_timestamp().await,
+            } },
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+        })
+    }
+
+    /// The `signatureTimestamp` of YouTube's current player script.
+    ///
+    /// The player endpoint answers "UNPLAYABLE: Video unavailable" (and leaves out the
+    /// playback tracking URLs that history reports need) unless the request carries the
+    /// timestamp of the live player script. It changes every few days; re-read every 12 hours.
+    async fn signature_timestamp(&self) -> u32 {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+        const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+        let mut cached = self.sts.lock().await;
+        if let Some((sts, at)) = *cached {
+            if at.elapsed() < if sts == 0 { RETRY_AFTER } else { MAX_AGE } {
+                return sts;
+            }
+        }
+        let fresh = match self.fetch_signature_timestamp().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("couldn't read YouTube's player signature timestamp: {e:#}");
+                // Keep using the last known value, if any; otherwise retry in a few minutes.
+                cached.map(|(v, _)| v).unwrap_or(0)
+            }
+        };
+        *cached = Some((fresh, std::time::Instant::now()));
+        fresh
+    }
+
+    async fn fetch_signature_timestamp(&self) -> anyhow::Result<u32> {
+        let get = |url: String| async move {
+            let timer = ytlog::start("playerjs", "fetch", url.clone());
+            let r = self.http.get(&url).header("user-agent", UA).timeout(std::time::Duration::from_secs(20)).send().await;
+            let r = match r {
+                Ok(r) => r,
+                Err(e) => {
+                    timer.done(if e.is_timeout() { "timeout" } else { "network-error" }, None, 1, Some(e.to_string()));
+                    return Err(anyhow::Error::from(e));
+                }
+            };
+            let code = r.status().as_u16();
+            if !r.status().is_success() {
+                timer.done("http-error", Some(code), 1, None);
+                bail!("{url}: HTTP {code}");
+            }
+            timer.done("ok", Some(code), 1, None);
+            Ok(r.text().await?)
+        };
+        let page = get(format!("{ORIGIN}/")).await?;
+        let js_url = regex::Regex::new(r#""jsUrl":"([^"]+)""#)?
+            .captures(&page)
+            .map(|c| c[1].to_string())
+            .context("no player script URL on the YouTube Music page")?;
+        let js = get(format!("{ORIGIN}{js_url}")).await?;
+        let sts = regex::Regex::new(r"(?:signatureTimestamp|sts)\s*:\s*(\d{5})")?
+            .captures(&js)
+            .and_then(|c| c[1].parse().ok())
+            .context("no signature timestamp in the player script")?;
+        tracing::info!("YouTube player signature timestamp: {sts}");
+        Ok(sts)
     }
 
     /// Register a play in the user's YouTube / YouTube Music history.
@@ -437,17 +713,15 @@ impl YtMusic {
         if !matches!(creds, Creds::Cookie(_)) {
             bail!("YouTube history needs your YouTube Music sign-in");
         }
-        let v = self.post_with(
-            "player",
-            json!({
-                "videoId": video_id,
-                "playbackContext": { "contentPlaybackContext": { "signatureTimestamp": 0 } }
-            }),
-            self.active_creds().await,
-        ).await?;
-        let url = v["playbackTracking"]["videostatsPlaybackUrl"]["baseUrl"]
-            .as_str()
-            .context("player response has no videostatsPlaybackUrl (cookie expired?)")?;
+        let body = self.player_body(video_id).await;
+        let v = self.post_with("player", body, self.active_creds().await).await?;
+        let Some(url) = v["playbackTracking"]["videostatsPlaybackUrl"]["baseUrl"].as_str() else {
+            let status = v["playabilityStatus"]["status"].as_str().unwrap_or("?");
+            let reason = v["playabilityStatus"]["reason"].as_str().unwrap_or("no reason given");
+            // A stale signature timestamp is the usual cause: read it again next time.
+            *self.sts.lock().await = None;
+            bail!("YouTube's player response has no history URL ({status}: {reason})");
+        };
         let cpn: String = {
             const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
             let mut rng = rand::thread_rng();
@@ -468,10 +742,20 @@ impl YtMusic {
             }
             _ => {}
         }
-        let resp = req.send().await?;
+        let timer = ytlog::start("history", "videostats", video_id);
+        let resp = match req.timeout(std::time::Duration::from_secs(20)).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                timer.done(if e.is_timeout() { "timeout" } else { "network-error" }, None, 1, Some(e.to_string()));
+                return Err(e.into());
+            }
+        };
+        let code = resp.status().as_u16();
         if !resp.status().is_success() {
+            timer.done("http-error", Some(code), 1, None);
             bail!("history ping failed: {}", resp.status());
         }
+        timer.done("ok", Some(code), 1, None);
         Ok(())
     }
 }
@@ -484,6 +768,29 @@ enum SendError {
     /// Server error or network hiccup: worth retrying.
     Retryable(anyhow::Error),
     Fatal(anyhow::Error),
+}
+
+/// What a request was about, for the request log.
+fn request_detail(body: &Value) -> String {
+    for k in ["query", "videoId", "browseId", "playlistId"] {
+        if let Some(v) = body[k].as_str() {
+            return v.chars().take(80).collect();
+        }
+    }
+    if body.get("continuation").is_some() {
+        return "continuation".into();
+    }
+    String::new()
+}
+
+impl Creds {
+    fn label(&self) -> &'static str {
+        match self {
+            Creds::Cookie(_) => "signed-in",
+            Creds::Visitor(_) => "fresh",
+            Creds::Anonymous => "anon",
+        }
+    }
 }
 
 enum Creds {
@@ -521,7 +828,7 @@ fn client_version() -> String {
 }
 
 /// Howard Hinnant's days-from-epoch -> (year, month, day).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -795,6 +1102,185 @@ fn parse_shelves(v: &Value) -> Vec<Shelf> {
         .collect()
 }
 
+// ---- search & artist pages ---------------------------------------------------------------
+
+fn browse_ref(nav: &Value) -> Option<BrowseRef> {
+    let b = nav.get("browseEndpoint")?;
+    Some(BrowseRef { browse_id: b["browseId"].as_str()?.to_string(), params: b["params"].as_str().map(String::from) })
+}
+
+fn nav_page_type(nav: &Value) -> Option<&str> {
+    nav["browseEndpoint"]["browseEndpointContextSupportedConfigs"]["browseEndpointContextMusicConfig"]["pageType"].as_str()
+}
+
+/// What a search result row is, from where it links and its "Song • …" / "Album • …" subtitle.
+enum Hit {
+    Song(Track),
+    Video(Track),
+    Artist(HomeItem),
+    Album(HomeItem),
+    Playlist(HomeItem),
+}
+
+fn classify_row(item: &Value) -> Option<Hit> {
+    let cols = item["flexColumns"].as_array()?;
+    let col = |i: usize| text(&cols.get(i).map(|c| &c["musicResponsiveListItemFlexColumnRenderer"]["text"]).unwrap_or(&Value::Null));
+    let title = col(0);
+    let subtitle = col(1);
+    let mut parts = subtitle.split(" • ");
+    let kind_word = parts.next().unwrap_or_default().to_string();
+    let rest = parts.collect::<Vec<_>>().join(" • ");
+    let thumbnail = last_thumbnail(&item["thumbnail"]);
+    let nav = &item["navigationEndpoint"];
+    if let Some(r) = browse_ref(nav) {
+        let item = |kind: &str, subtitle: String, playlist_id: Option<String>| HomeItem {
+            kind: kind.into(),
+            title: title.clone(),
+            subtitle,
+            thumbnail: thumbnail.clone(),
+            video_id: None,
+            playlist_id,
+            browse_id: Some(r.browse_id.clone()),
+            track: None,
+        };
+        return match nav_page_type(nav)? {
+            "MUSIC_PAGE_TYPE_ARTIST" => Some(Hit::Artist(item("artist", if kind_word == "Artist" { rest } else { subtitle.clone() }, None))),
+            "MUSIC_PAGE_TYPE_ALBUM" => Some(Hit::Album(item("album", subtitle.clone(), None))),
+            "MUSIC_PAGE_TYPE_PLAYLIST" => {
+                let pid = r.browse_id.trim_start_matches("VL").to_string();
+                Some(Hit::Playlist(item("playlist", subtitle.clone(), Some(pid))))
+            }
+            _ => None, // profiles, podcasts
+        };
+    }
+    let track = parse_responsive(item)?;
+    match kind_word.as_str() {
+        "Video" => Some(Hit::Video(track)),
+        "Episode" | "Podcast" => None,
+        _ => Some(Hit::Song(track)), // "Song", or no prefix in filtered results
+    }
+}
+
+/// YouTube Music's search page. The "top result" card comes first; every other result is a row
+/// (in its own section in the unfiltered layout, in shelves in filtered ones).
+fn parse_search(v: &Value) -> SearchResults {
+    let mut out = SearchResults::default();
+    if let Some(card) = find_first(v, "musicCardShelfRenderer") {
+        let run = &card["title"]["runs"][0];
+        let nav = &run["navigationEndpoint"];
+        let title = text(&card["title"]);
+        let subtitle = text(&card["subtitle"]);
+        let thumbnail = last_thumbnail(&card["thumbnail"]);
+        let base = HomeItem { kind: String::new(), title: title.clone(), subtitle: subtitle.clone(), thumbnail: thumbnail.clone(), video_id: None, playlist_id: None, browse_id: None, track: None };
+        out.top = if let Some(r) = browse_ref(nav) {
+            let kind = match nav_page_type(nav) {
+                Some("MUSIC_PAGE_TYPE_ARTIST") => "artist",
+                Some("MUSIC_PAGE_TYPE_ALBUM") => "album",
+                Some("MUSIC_PAGE_TYPE_PLAYLIST") => "playlist",
+                _ => "",
+            };
+            (!kind.is_empty()).then(|| HomeItem {
+                kind: kind.into(),
+                subtitle: subtitle.trim_start_matches("Artist • ").to_string(),
+                playlist_id: (kind == "playlist").then(|| r.browse_id.trim_start_matches("VL").to_string()),
+                browse_id: Some(r.browse_id),
+                ..base.clone()
+            })
+        } else if let Some(vid) = nav["watchEndpoint"]["videoId"].as_str() {
+            let runs: Vec<&Value> = card["subtitle"]["runs"].as_array().map(|r| r.iter().collect()).unwrap_or_default();
+            let (artists, album, duration) = split_byline(&runs);
+            let t = Track { video_id: vid.into(), title: title.clone(), artist: artists.join(", "), album, duration, thumbnail: thumbnail.clone() };
+            Some(HomeItem { kind: "song".into(), video_id: Some(vid.into()), track: Some(t), ..base })
+        } else {
+            None
+        };
+    }
+    let mut rows = Vec::new();
+    find_all(v, "musicResponsiveListItemRenderer", &mut rows);
+    for r in rows {
+        match classify_row(r) {
+            Some(Hit::Song(t)) => out.songs.push(t),
+            Some(Hit::Video(t)) => out.videos.push(t),
+            Some(Hit::Artist(a)) => out.artists.push(a),
+            Some(Hit::Album(a)) => out.albums.push(a),
+            Some(Hit::Playlist(p)) => out.playlists.push(p),
+            None => {}
+        }
+    }
+    // Songs inside an artist's top-result card leave out the artist's name.
+    if let Some(top) = out.top.as_ref().filter(|t| t.kind == "artist") {
+        for t in out.songs.iter_mut().filter(|t| t.artist.is_empty()) {
+            t.artist = top.title.clone();
+        }
+    }
+    dedupe(&mut out.songs);
+    dedupe(&mut out.videos);
+    // The top result shouldn't be listed again below it.
+    if let Some(top_id) = out.top.as_ref().and_then(|t| t.browse_id.clone()) {
+        out.artists.retain(|a| a.browse_id.as_deref() != Some(&top_id));
+        out.albums.retain(|a| a.browse_id.as_deref() != Some(&top_id));
+    }
+    out
+}
+
+fn parse_artist(v: &Value, id: &str) -> Option<ArtistPage> {
+    let h = find_first(&v["header"], "musicImmersiveHeaderRenderer").or_else(|| find_first(&v["header"], "musicVisualHeaderRenderer"))?;
+    let name = text(&h["title"]);
+    let stats = Some(text(&h["monthlyListenerCount"]))
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let subs = text(&h["subscriptionButton"]["subscribeButtonRenderer"]["subscriberCountText"]);
+            (!subs.is_empty()).then(|| format!("{subs} subscribers"))
+        });
+    let radio_playlist_id = h["startRadioButton"]["buttonRenderer"]["navigationEndpoint"]["watchEndpoint"]["playlistId"]
+        .as_str()
+        .or_else(|| h["startRadioButton"]["buttonRenderer"]["navigationEndpoint"]["watchPlaylistEndpoint"]["playlistId"].as_str())
+        .map(String::from);
+    let sections = find_first(&v["contents"], "sectionListRenderer").and_then(|s| s["contents"].as_array());
+    let mut top_songs = Vec::new();
+    let mut songs_playlist_id = None;
+    let mut shelves = Vec::new();
+    for s in sections.into_iter().flatten() {
+        if let Some(shelf) = s.get("musicShelfRenderer") {
+            let mut rows = Vec::new();
+            find_all(shelf, "musicResponsiveListItemRenderer", &mut rows);
+            top_songs.extend(rows.into_iter().filter_map(parse_responsive));
+            let more = browse_ref(&shelf["bottomEndpoint"]).or_else(|| browse_ref(&shelf["title"]["runs"][0]["navigationEndpoint"]));
+            songs_playlist_id = more.map(|m| m.browse_id.trim_start_matches("VL").to_string());
+        } else if let Some(c) = s.get("musicCarouselShelfRenderer") {
+            let hh = &c["header"]["musicCarouselShelfBasicHeaderRenderer"];
+            let title = text(&hh["title"]);
+            let items: Vec<HomeItem> = c["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.get("musicTwoRowItemRenderer").and_then(parse_two_row))
+                .collect();
+            if items.is_empty() {
+                continue;
+            }
+            // Only discography grids and playlists can be opened here ("Live performances" and
+            // "Playlists by" link back into the channel itself).
+            let more = browse_ref(&hh["moreContentButton"]["buttonRenderer"]["navigationEndpoint"])
+                .or_else(|| browse_ref(&hh["title"]["runs"][0]["navigationEndpoint"]))
+                .filter(|m| m.browse_id.starts_with("MPAD") || m.browse_id.starts_with("VL"));
+            shelves.push(ArtistShelf { title, items, more });
+        }
+    }
+    dedupe(&mut top_songs);
+    Some(ArtistPage {
+        id: id.to_string(),
+        name,
+        thumbnail: last_thumbnail(&h["thumbnail"]),
+        description: Some(text(&h["description"])).filter(|d| !d.is_empty()),
+        stats,
+        radio_playlist_id,
+        top_songs,
+        songs_playlist_id,
+        shelves,
+    })
+}
+
 #[derive(Default)]
 struct HeaderInfo {
     title: Option<String>,
@@ -838,6 +1324,41 @@ mod tests {
     fn civil() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20_397), (2025, 11, 5));
+    }
+
+    #[test]
+    fn search_rows_by_kind() {
+        let nav = |pt: &str, id: &str| json!({"browseEndpoint": {"browseId": id, "browseEndpointContextSupportedConfigs": {"browseEndpointContextMusicConfig": {"pageType": pt}}}});
+        let row = |title: &str, sub: &str, nav: Value, vid: Option<&str>| {
+            let mut r = json!({"musicResponsiveListItemRenderer": {"flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": title}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": sub}]}}}
+            ], "navigationEndpoint": nav}});
+            if let Some(v) = vid {
+                r["musicResponsiveListItemRenderer"]["playlistItemData"] = json!({"videoId": v});
+            }
+            json!({"itemSectionRenderer": {"contents": [r]}})
+        };
+        let v = json!({"contents": [
+            {"musicCardShelfRenderer": {"title": {"runs": [{"text": "Band", "navigationEndpoint": nav("MUSIC_PAGE_TYPE_ARTIST", "UC1")}]},
+                "subtitle": {"runs": [{"text": "Artist • 1M monthly audience"}]}}},
+            row("Record", "Album • Band • 1997", nav("MUSIC_PAGE_TYPE_ALBUM", "MPRE1"), None),
+            row("Other", "Artist • 5K subscribers", nav("MUSIC_PAGE_TYPE_ARTIST", "UC2"), None),
+            row("Band", "Artist • 1M monthly audience", nav("MUSIC_PAGE_TYPE_ARTIST", "UC1"), None),
+            row("Fan", "Profile • @fan", nav("MUSIC_PAGE_TYPE_USER_CHANNEL", "UC3"), None),
+            row("Hit", "Song • Band", json!({}), Some("v1")),
+            row("Hit (Live)", "Video • Band • 1M views", json!({}), Some("v2")),
+            row("Talk", "Episode • Pod", json!({}), Some("v3")),
+            row("Mix", "Playlist • Someone", nav("MUSIC_PAGE_TYPE_PLAYLIST", "VLPL1"), None),
+        ]});
+        let s = parse_search(&v);
+        let top = s.top.unwrap();
+        assert_eq!((top.kind.as_str(), top.browse_id.as_deref(), top.subtitle.as_str()), ("artist", Some("UC1"), "1M monthly audience"));
+        assert_eq!(s.artists.iter().map(|a| a.title.as_str()).collect::<Vec<_>>(), ["Other"]); // top result not repeated, profile skipped
+        assert_eq!(s.albums[0].browse_id.as_deref(), Some("MPRE1"));
+        assert_eq!(s.songs.iter().map(|t| t.video_id.as_str()).collect::<Vec<_>>(), ["v1"]);
+        assert_eq!(s.videos[0].video_id, "v2");
+        assert_eq!(s.playlists[0].playlist_id.as_deref(), Some("PL1"));
     }
 
     #[test]

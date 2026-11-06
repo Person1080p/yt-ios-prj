@@ -41,6 +41,50 @@ pub struct ResolvedStream {
     pub album: Option<String>,
     pub duration: Option<u32>,
     pub thumbnail: Option<String>,
+    /// Audio bitrate in kbps, when yt-dlp reports it.
+    pub kbps: Option<u32>,
+}
+
+/// How much audio data to send. The browser picks it from how fast its connection to this
+/// server is (a bitrate budget); the server maps that to a YouTube format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioLevel {
+    /// ~130 kbps (AAC 140 / Opus 251)
+    High,
+    /// ~66 kbps (Opus 250), or ~49 kbps HE-AAC where Opus can't play
+    Medium,
+    /// ~50 kbps (Opus 249 / HE-AAC 139)
+    Low,
+}
+
+impl AudioLevel {
+    /// The richest level that fits `budget_kbps` (None: no limit).
+    pub fn for_budget(budget_kbps: Option<u32>) -> Self {
+        match budget_kbps {
+            None => Self::High,
+            Some(k) if k >= 128 => Self::High,
+            Some(k) if k >= 64 => Self::Medium,
+            Some(_) => Self::Low,
+        }
+    }
+
+    /// yt-dlp format selector. `opus`: the browser can play WebM/Opus (Safari often can't).
+    fn format(self, opus: bool) -> &'static str {
+        match (self, opus) {
+            (Self::High, _) => FORMAT,
+            (Self::Medium, true) => "250/139/249/bestaudio[ext=m4a]/bestaudio/best",
+            (Self::Low, true) => "249/139/250/bestaudio[ext=m4a]/bestaudio/best",
+            (_, false) => "139/bestaudio[ext=m4a]/bestaudio/best",
+        }
+    }
+
+    pub fn nominal_kbps(self) -> u32 {
+        match self {
+            Self::High => 130,
+            Self::Medium => 66,
+            Self::Low => 50,
+        }
+    }
 }
 
 pub struct YtDlp {
@@ -136,27 +180,44 @@ impl YtDlp {
     }
 
     pub async fn invalidate(&self, video_id: &str) {
-        self.cache.lock().await.remove(video_id);
+        let prefix = format!("{video_id}|");
+        self.cache.lock().await.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Resolve the direct audio URL (cached for a few hours; googlevideo URLs expire after ~6h).
-    pub async fn resolve(&self, video_id: &str) -> anyhow::Result<ResolvedStream> {
-        if let Some((s, at)) = self.cache.lock().await.get(video_id) {
+    pub async fn resolve(&self, video_id: &str, level: AudioLevel, opus: bool) -> anyhow::Result<ResolvedStream> {
+        let format = level.format(opus);
+        let key = format!("{video_id}|{format}");
+        // The stream and the quality lookup ask at the same moment: run yt-dlp once.
+        let (_flight, _) = crate::services::cache::Flight::join(&format!("ytdlp:{key}")).await;
+        if let Some((s, at)) = self.cache.lock().await.get(&key) {
             if at.elapsed() < URL_TTL {
                 return Ok(s.clone());
             }
         }
         let bin = self.binary().await?;
-        let out = Command::new(bin)
-            .args(["-f", FORMAT, "-j", "--no-playlist", "--no-warnings", "--no-progress"])
+        let detail = if level == AudioLevel::High { video_id.to_string() } else { format!("{video_id} ({level:?})") };
+        let timer = crate::services::ytlog::start("ytdlp", "resolve", detail);
+        let out = match Command::new(bin)
+            .args(["-f", format, "-j", "--no-playlist", "--no-warnings", "--no-progress"])
             .arg(watch_url(video_id))
             .stdin(Stdio::null())
             .output()
             .await
-            .context("running yt-dlp")?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                timer.done("error", None, 1, Some(e.to_string()));
+                return Err(anyhow::Error::new(e).context("running yt-dlp"));
+            }
+        };
         if !out.status.success() {
-            bail!("yt-dlp failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let outcome = if err.contains("429") || err.contains("Sign in to confirm") { "rate-limited" } else { "error" };
+            timer.done(outcome, None, 1, Some(err.chars().take(200).collect()));
+            bail!("yt-dlp failed: {err}");
         }
+        timer.done("ok", None, 1, None);
         let v: Value = serde_json::from_slice(&out.stdout).context("parsing yt-dlp json")?;
         let url = v["url"].as_str().context("yt-dlp returned no url")?.to_string();
         let ext = v["ext"].as_str().unwrap_or("m4a");
@@ -183,16 +244,18 @@ impl YtDlp {
             album: s("album"),
             duration: v["duration"].as_f64().map(|d| d.round() as u32),
             thumbnail: s("thumbnail"),
+            kbps: v["abr"].as_f64().or_else(|| v["tbr"].as_f64()).map(|k| k.round() as u32),
         };
-        self.cache.lock().await.insert(video_id.to_string(), (resolved.clone(), Instant::now()));
+        self.cache.lock().await.insert(key, (resolved.clone(), Instant::now()));
         Ok(resolved)
     }
 
     /// Spawn yt-dlp writing the audio to stdout. The child is killed when the returned value is dropped.
-    pub async fn pipe(&self, video_id: &str) -> anyhow::Result<tokio::process::Child> {
+    pub async fn pipe(&self, video_id: &str, level: AudioLevel, opus: bool) -> anyhow::Result<tokio::process::Child> {
         let bin = self.binary().await?;
+        crate::services::ytlog::start("ytdlp", "pipe", video_id).done("ok", None, 1, None);
         let child = Command::new(bin)
-            .args(["-f", FORMAT, "-o", "-", "--quiet", "--no-playlist", "--no-part"])
+            .args(["-f", level.format(opus), "-o", "-", "--quiet", "--no-playlist", "--no-part"])
             .arg(watch_url(video_id))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

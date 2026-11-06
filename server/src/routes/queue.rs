@@ -37,7 +37,7 @@ fn maybe_autofill(st: SharedState, q: &Queue) {
     }
     let Some(seed) = q.items.last().map(|i| i.track.clone()) else { return };
     let mut exclude: HashSet<String> = q.items.iter().map(|i| i.track.video_id.clone()).collect();
-    tokio::spawn(async move {
+    crate::services::ytlog::spawn("queue autofill", async move {
         if let Ok(recent) = st.db.recent_video_ids(30).await {
             exclude.extend(recent);
         }
