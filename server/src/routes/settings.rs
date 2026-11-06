@@ -120,12 +120,12 @@ pub struct Prefs {
     /// Spacing of import/sync requests to YouTube: "normal" | "slow" | "very_slow"
     #[serde(default = "default_pace")]
     import_pace: String,
-    /// Hours MP3 copies of YouTube plays are kept and used (0: off).
+    /// Hours MP3 copies of YouTube plays are kept and used (0: off, -1: forever).
     #[serde(default = "default_cache_hours")]
-    audio_cache_hours: u32,
+    audio_cache_hours: i32,
 }
 
-fn default_cache_hours() -> u32 {
+fn default_cache_hours() -> i32 {
     audiocache::DEFAULT_HOURS
 }
 
@@ -164,8 +164,12 @@ pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> A
     if pace_base_ms(&p.import_pace).is_none() {
         return Err(AppError::bad("importPace must be original, normal, slow or very_slow"));
     }
-    if p.audio_cache_hours > audiocache::MAX_HOURS {
-        return Err(AppError::bad(format!("audioCacheHours must be 0 to {}", audiocache::MAX_HOURS)));
+    if p.audio_cache_hours != audiocache::FOREVER && !(0..=audiocache::MAX_HOURS).contains(&p.audio_cache_hours) {
+        return Err(AppError::bad(format!(
+            "audioCacheHours must be 0 to {}, or {} to keep copies forever",
+            audiocache::MAX_HOURS,
+            audiocache::FOREVER
+        )));
     }
     st.db.set_setting("prefs.prefer_plex", if p.prefer_plex { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.scrobble", if p.scrobble { "1" } else { "0" }).await?;

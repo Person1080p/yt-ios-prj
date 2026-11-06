@@ -70,6 +70,7 @@ export type Prefs = {
   /** Spacing of import/sync requests to YouTube. */
   importPace: "original" | "normal" | "slow" | "very_slow";
   /** Hours the server keeps and plays MP3 copies of fully loaded YouTube tracks (0: off). */
+  /** Hours to keep cached MP3s: 0 is off, -1 is forever. */
   audioCacheHours: number;
 };
 

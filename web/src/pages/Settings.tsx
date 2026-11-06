@@ -473,6 +473,9 @@ function Preferences({ status, reload }: { status: Status; reload: () => void })
   );
 }
 
+/** `audioCacheHours` value for copies that never expire. */
+const CACHE_FOREVER = -1;
+
 const CACHE_HOURS = [
   [0, "Off"],
   [1, "1 hour"],
@@ -483,6 +486,7 @@ const CACHE_HOURS = [
   [72, "3 days"],
   [168, "1 week"],
   [720, "30 days"],
+  [CACHE_FOREVER, "Forever"],
 ] as const;
 
 /** Server-wide: MP3 copies of fully loaded YouTube tracks, kept in the server's data folder. */
@@ -504,7 +508,10 @@ function AudioCache({ status, hours, onChange }: { status: Status; hours: number
       </select>
       <span className="small muted">
         {c.available
-          ? `Once a song from YouTube has fully loaded at high quality, the server saves it as a tagged MP3 (title, artist, album, cover) and plays that copy instead, shown as “Cached”. ${c.files} saved now (${size}).`
+          ? `Once a song from YouTube has fully loaded at high quality, the server saves it as a tagged MP3 (title, artist, album, cover) and plays that copy instead, shown as “Cached”. ${c.files} saved now (${size}).` +
+            (hours === CACHE_FOREVER
+              ? " Copies are never deleted automatically; remove files from the server's data/audio-cache folder to free space."
+              : "")
           : "Needs ffmpeg on the server (install it, or set YTP_FFMPEG), then restart the server."}
       </span>
     </label>

@@ -4,7 +4,7 @@
 //! (every byte, across however many Range requests that took), the bytes the server passed through
 //! are transcoded into `<data>/audio-cache/Artist - Title [videoId].mp3`, tagged with the song's
 //! title, artist, album and cover art. New plays of that track are then served from the file, as their own source
-//! ("cache"), for a configurable time (Settings → Playback; 3 hours by default, 0 turns it off).
+//! ("cache"), for a configurable time (Settings → Playback; 3 hours by default, or forever, or off).
 //! Nothing is downloaded twice: the copy is assembled from the stream the browser was already getting.
 
 use std::{
@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicI32, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime},
@@ -28,10 +28,14 @@ use tokio::{
 
 use crate::db::Db;
 
-/// Setting: how many hours a copy is offered to new plays (0: the cache is off).
+/// Setting: how many hours a copy is offered to new plays (0: the cache is off; [`FOREVER`]: copies
+/// are kept and used until someone deletes them).
 pub const HOURS_KEY: &str = "prefs.audio_cache_hours";
-pub const DEFAULT_HOURS: u32 = 3;
-pub const MAX_HOURS: u32 = 24 * 30;
+pub const DEFAULT_HOURS: i32 = 3;
+pub const MAX_HOURS: i32 = 24 * 30;
+pub const FOREVER: i32 = -1;
+/// With copies kept forever, how long to remember what a play started from (for its seeks).
+const FOREVER_STARTED: Duration = Duration::from_secs(12 * 3600);
 /// Files are kept this much longer than they're offered, so a song that started from the cache
 /// can still seek when its time runs out mid-song.
 const GRACE: Duration = Duration::from_secs(30 * 60);
@@ -58,7 +62,7 @@ pub struct Meta {
 pub struct Stats {
     /// ffmpeg was found; without it nothing is cached.
     pub available: bool,
-    pub hours: u32,
+    pub hours: i32,
     pub files: u64,
     pub bytes: u64,
 }
@@ -68,7 +72,7 @@ pub struct AudioCache {
     ffmpeg: Option<PathBuf>,
     db: Db,
     http: reqwest::Client,
-    ttl_secs: AtomicU64,
+    hours: AtomicI32,
     /// Finished copies by video id. File names carry the id (`... [videoId].mp3`) but start with
     /// the song's name, so they're found through this index instead of by building the name.
     files: Mutex<HashMap<String, PathBuf>>,
@@ -138,7 +142,7 @@ impl AudioCache {
             ffmpeg,
             db,
             http,
-            ttl_secs: AtomicU64::new(u64::from(DEFAULT_HOURS) * 3600),
+            hours: AtomicI32::new(DEFAULT_HOURS),
             files: Mutex::new(HashMap::new()),
             parts: Mutex::new(HashMap::new()),
             started: Mutex::new(HashMap::new()),
@@ -150,7 +154,7 @@ impl AudioCache {
     /// Copies from before files were named after the song (`<videoId>.mp3`) are renamed.
     pub async fn load(&self) {
         let hours = self.db.get_setting(HOURS_KEY).await.ok().flatten().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_HOURS);
-        self.ttl_secs.store(u64::from(hours.min(MAX_HOURS)) * 3600, Ordering::Relaxed);
+        self.hours.store(normalize(hours), Ordering::Relaxed);
 
         let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else { return };
         let mut found: HashMap<String, (PathBuf, SystemTime)> = HashMap::new();
@@ -181,22 +185,31 @@ impl AudioCache {
         files.extend(found.into_iter().map(|(id, (path, _))| (id, path)));
     }
 
-    pub fn hours(&self) -> u32 {
-        (self.ttl_secs.load(Ordering::Relaxed) / 3600) as u32
+    pub fn hours(&self) -> i32 {
+        self.hours.load(Ordering::Relaxed)
     }
 
-    /// Change how long copies are offered (0: off). A shorter time applies to existing copies too.
-    pub async fn set_hours(self: &Arc<Self>, hours: u32) -> anyhow::Result<()> {
-        let hours = hours.min(MAX_HOURS);
+    /// Change how long copies are offered (0: off, [`FOREVER`]: never expire). A shorter time
+    /// applies to existing copies too.
+    pub async fn set_hours(self: &Arc<Self>, hours: i32) -> anyhow::Result<()> {
+        let hours = normalize(hours);
         self.db.set_setting(HOURS_KEY, &hours.to_string()).await?;
-        self.ttl_secs.store(u64::from(hours) * 3600, Ordering::Relaxed);
+        self.hours.store(hours, Ordering::Relaxed);
         let this = self.clone();
         tokio::spawn(async move { this.purge().await });
         Ok(())
     }
 
-    fn ttl(&self) -> Duration {
-        Duration::from_secs(self.ttl_secs.load(Ordering::Relaxed))
+    fn enabled(&self) -> bool {
+        self.hours() != 0
+    }
+
+    /// How long copies are offered; None when they're kept forever.
+    fn ttl(&self) -> Option<Duration> {
+        match self.hours() {
+            FOREVER => None,
+            h => Some(Duration::from_secs(h.max(0) as u64 * 3600)),
+        }
     }
 
     pub async fn stats(&self) -> Stats {
@@ -224,8 +237,7 @@ impl AudioCache {
     }
 
     fn fresh(&self, video_id: &str) -> bool {
-        let ttl = self.ttl();
-        !ttl.is_zero() && self.age(video_id).is_some_and(|a| a < ttl)
+        self.enabled() && self.age(video_id).is_some_and(|a| self.ttl().is_none_or(|ttl| a < ttl))
     }
 
     /// Whether `/source` should report the cache: a fresh copy, and the client's quality allows it.
@@ -258,7 +270,7 @@ impl AudioCache {
     /// do (cache off, no ffmpeg, already cached, or already complete).
     pub fn tee(self: &Arc<Self>, video_id: &str, offset: u64, total: u64, meta: Meta) -> Option<mpsc::UnboundedSender<Bytes>> {
         let ffmpeg = self.ffmpeg.clone()?;
-        if self.ttl().is_zero() || total == 0 || total > MAX_SOURCE_BYTES || offset >= total || self.fresh(video_id) {
+        if !self.enabled() || total == 0 || total > MAX_SOURCE_BYTES || offset >= total || self.fresh(video_id) {
             return None;
         }
         let part = {
@@ -359,7 +371,10 @@ impl AudioCache {
                     // An older copy under another name (the song was renamed) is left for the
                     // purge loop, in case a play that started from it is still seeking.
                     self.files.lock().unwrap_or_else(|p| p.into_inner()).insert(vid.clone(), out);
-                    tracing::info!("audio cache: saved \"{stem}.mp3\" for {} h", self.hours());
+                    match self.ttl() {
+                        Some(ttl) => tracing::info!("audio cache: saved \"{stem}.mp3\" for {} h", ttl.as_secs() / 3600),
+                        None => tracing::info!("audio cache: saved \"{stem}.mp3\" (kept forever)"),
+                    }
                 }
                 Err(e) => tracing::warn!("audio cache: saving {vid}: {e}"),
             },
@@ -414,19 +429,22 @@ impl AudioCache {
     /// Delete expired copies and abandoned partial files.
     async fn purge(&self) {
         let now = SystemTime::now();
-        let ttl = self.ttl();
+        // How long finished copies stay on disk; None: forever.
+        let keep_mp3 = self.ttl().map(|ttl| ttl + GRACE);
         {
             let mut parts = self.parts.lock().unwrap_or_else(|p| p.into_inner());
             parts.retain(|_, p| p.state.lock().unwrap_or_else(|e| e.into_inner()).touched.elapsed() < PART_IDLE);
             let mut started = self.started.lock().unwrap_or_else(|p| p.into_inner());
-            started.retain(|_, (_, at)| at.elapsed() < ttl + GRACE);
+            let keep_started = keep_mp3.unwrap_or(FOREVER_STARTED);
+            started.retain(|_, (_, at)| at.elapsed() < keep_started);
         }
         let Ok(mut entries) = tokio::fs::read_dir(&self.dir).await else { return };
         let mut removed = 0;
         while let Ok(Some(e)) = entries.next_entry().await {
             let name = e.file_name().to_string_lossy().into_owned();
             let keep_for = if name.ends_with(".mp3") {
-                ttl + GRACE
+                let Some(keep) = keep_mp3 else { continue };
+                keep
             } else if name.ends_with(".part") || name.ends_with(".tmp") {
                 PART_IDLE
             } else {
@@ -477,6 +495,11 @@ impl Meta {
         out.push(("comment", format!("https://music.youtube.com/watch?v={video_id}")));
         out
     }
+}
+
+/// A valid hours setting: [`FOREVER`], or 0 (off) to [`MAX_HOURS`].
+fn normalize(hours: i32) -> i32 {
+    if hours == FOREVER { FOREVER } else { hours.clamp(0, MAX_HOURS) }
 }
 
 /// Longest the "Artist - Title" part of a name may be, in bytes (file systems allow 255).
@@ -580,6 +603,15 @@ mod tests {
         let keys: Vec<_> = pairs.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, ["title", "artist", "album_artist", "comment"]);
         assert_eq!(pairs.last().unwrap().1, "https://music.youtube.com/watch?v=abc");
+    }
+
+    #[test]
+    fn hours_settings_normalize() {
+        assert_eq!(normalize(FOREVER), FOREVER);
+        assert_eq!(normalize(0), 0);
+        assert_eq!(normalize(-5), 0);
+        assert_eq!(normalize(6), 6);
+        assert_eq!(normalize(100_000), MAX_HOURS);
     }
 
     fn meta(artist: Option<&str>, title: Option<&str>) -> Meta {
