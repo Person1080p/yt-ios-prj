@@ -1,3 +1,4 @@
+pub mod audiocache;
 pub mod cache;
 pub mod fileimport;
 pub mod importers;

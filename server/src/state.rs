@@ -7,6 +7,7 @@ use crate::{
     config::Config,
     db::Db,
     services::{
+        audiocache::AudioCache,
         lastfm::LastFm,
         playback::PlaySession,
         plex::Plex,
@@ -33,6 +34,8 @@ pub struct AppState {
     pub http: reqwest::Client,
     pub yt: YtMusic,
     pub ytdlp: YtDlp,
+    /// Short-lived MP3 copies of YouTube tracks (the "cache" audio source).
+    pub audio_cache: Arc<AudioCache>,
     pub plex: Plex,
     pub lastfm: LastFm,
     pub queue: Mutex<Queue>,

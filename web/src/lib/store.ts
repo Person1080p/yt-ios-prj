@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Queue, Track } from "./api";
+import type { AudioSource, Queue, Track } from "./api";
 
 type State = {
   queue: Queue | null;
@@ -7,7 +7,7 @@ type State = {
   buffering: boolean;
   position: number;
   duration: number;
-  source: "plex" | "youtube" | null;
+  source: AudioSource | null;
   /** Loaded parts of the current track, in seconds. */
   buffered: [number, number][];
   /** Bitrate (kbps) of the current track's stream, when known. */

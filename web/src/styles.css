@@ -193,6 +193,7 @@ a.btn { text-decoration: none; }
 .badge { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; vertical-align: 1px; margin-left: 4px; }
 .badge.plex { background: var(--plex); color: #111; }
 .badge.youtube { background: #c00; color: white; }
+.badge.cache { background: var(--ok); color: #111; }
 
 /* ---- now playing ---- */
 .now-playing {

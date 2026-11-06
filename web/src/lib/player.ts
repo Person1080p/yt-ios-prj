@@ -13,7 +13,7 @@
 // `volume` and only lets an element that has already played auto-advance in the
 // background, so there a single element is kept and only the download is done ahead.
 
-import { api, fetchAudio, randomId, streamUrl, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
+import { api, fetchAudio, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
 import { loadProfile } from "./profile";
@@ -74,7 +74,7 @@ let warmTimer: ReturnType<typeof setTimeout> | undefined;
 /** Video id the active element has loaded (set once its audio is actually in place). */
 let activeVideoId: string | null = null;
 /** What's loaded (or loading) in the spare element. `ready` is false while a tailnet download runs. */
-let spare: { el: HTMLAudioElement; videoId: string; key: string; ready: boolean; source?: "plex" | "youtube" | null } | null = null;
+let spare: { el: HTMLAudioElement; videoId: string; key: string; ready: boolean; source?: AudioSource | null } | null = null;
 
 // ---- per-element stream info and speed measurement ----------------------------------------
 
@@ -137,8 +137,9 @@ function setKbps(el: HTMLAudioElement, videoId: string, kbps: number | null) {
   if (el === audio) set({ streamKbps: kbps });
 }
 
-/** When the server couldn't say (its lookup failed): the usual YouTube bitrate for the budget. */
-function typicalKbps(source: "plex" | "youtube"): number | null {
+/** When the server couldn't say (its lookup failed): the usual bitrate for the source and budget. */
+function typicalKbps(source: AudioSource): number | null {
+  if (source === "cache") return 192;
   if (source !== "youtube") return null;
   const b = qualityBudget();
   return b == null || b >= 128 ? 130 : b >= 64 ? 66 : 50;
@@ -253,7 +254,7 @@ function unlockAudio() {
 
 // ---- tailnet audio blobs -----------------------------------------------------------------
 
-type Loaded = { url: string; source: "plex" | "youtube" | null; kbps: number | null };
+type Loaded = { url: string; source: AudioSource | null; kbps: number | null };
 const blobs = new Map<string, Loaded>();
 const inflight = new Map<string, Promise<Loaded>>();
 

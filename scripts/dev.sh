@@ -1,19 +1,63 @@
 #!/usr/bin/env bash
 # Runs the ytp server and the Vite dev server (which forwards /api to it) together.
 # Open the Vite address it prints (port 5173); stop both with Ctrl-C.
+#
+# On Windows this runs inside WSL: from Git Bash it hands off to scripts/dev.cmd, which mounts
+# the drive in WSL, installs the toolchain on first run (scripts/setup-wsl.sh) and comes back here.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# rustup / Go installs often aren't on PATH in a fresh shell.
-for d in "$HOME/.cargo/bin" "$HOME/.local/go/bin" "/usr/local/go/bin" "$HOME/go/bin"; do
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) exec cmd.exe //c "$(cygpath -w "$root/scripts/dev.cmd")" ;;
+esac
+
+# rustup / Go / Node installs often aren't on PATH in a fresh shell.
+for d in "$HOME/.cargo/bin" "$HOME/.local/go/bin" "/usr/local/go/bin" "$HOME/go/bin" "$HOME/.local/node/bin"; do
   [[ -d "$d" && ":$PATH:" != *":$d:"* ]] && PATH="$d:$PATH"
 done
 export PATH
 
+wsl=""
+grep -qi microsoft /proc/version 2>/dev/null && wsl=1
+hint="install it"
+[[ -n "$wsl" ]] && hint="run scripts/setup-wsl.sh"
+
 if ! command -v cargo >/dev/null; then
-  echo "error: cargo not found — install Rust from https://rustup.rs (or add ~/.cargo/bin to PATH)" >&2
+  echo "error: cargo not found — $hint, or install Rust from https://rustup.rs (or add ~/.cargo/bin to PATH)" >&2
   exit 1
 fi
+# WSL puts Windows' npm on PATH; it can't run the Linux Vite install, so insist on a Linux one.
+if ! npm_path="$(command -v npm)" || [[ "$npm_path" == /mnt/* ]]; then
+  echo "error: Node.js (Linux build) not found — $hint, or install Node 20+" >&2
+  exit 1
+fi
+
+if [[ -n "$wsl" && "$root" == /mnt/* ]]; then
+  # The project lives on a Windows drive: keep Rust's build output on the Linux filesystem
+  # (far faster than building over drvfs/SMB), and poll for changes because WSL gets no
+  # file-change events for edits made from Windows.
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/ytp/server-target}"
+  export CHOKIDAR_USEPOLLING="${CHOKIDAR_USEPOLLING:-1}"
+  # yt-dlp is a 40 MB self-unpacking binary read in full on every run (each new song): ~6 s from
+  # the share vs <1 s locally. Keep the managed copy on the Linux side, seeded from the share's.
+  export YTP_BIN_DIR="${YTP_BIN_DIR:-$HOME/.cache/ytp/bin}"
+  if [[ ! -e "$YTP_BIN_DIR/yt-dlp" && -f "$root/server/data/bin/yt-dlp" ]]; then
+    mkdir -p "$YTP_BIN_DIR"
+    cp "$root/server/data/bin/yt-dlp" "$YTP_BIN_DIR/yt-dlp" && chmod +x "$YTP_BIN_DIR/yt-dlp"
+  fi
+  # Network shares mounted in WSL can't hold symlinks, so npm can't link node_modules/.bin.
+  npm_ci_flags="--no-bin-links"
+fi
+
+if [[ ! -d "$root/web/node_modules" ]]; then
+  echo "==> installing web dependencies…"
+  (cd "$root/web" && npm ci ${npm_ci_flags:-})
+fi
+
+# `npm run dev` needs node_modules/.bin/vite, a symlink that's missing (or invisible) when the
+# project is on a share that can't hold symlinks — run Vite's entry point directly then.
+vite_cmd=(npm run dev)
+[[ -e "$root/web/node_modules/.bin/vite" ]] || vite_cmd=(node node_modules/vite/bin/vite.js)
 
 # The server's address, from server/.env (YTP_BIND), so Vite forwards /api to the right place.
 bind="$(grep -E '^YTP_BIND=' "$root/server/.env" 2>/dev/null | tail -1 | cut -d= -f2- || true)"
@@ -37,7 +81,7 @@ until curl -fs "$YTP_BACKEND/api/auth/check" >/dev/null 2>&1; do
 done
 echo "==> ytp server is up at $YTP_BACKEND; starting Vite"
 
-(cd "$root/web" && exec npm run dev) &
+(cd "$root/web" && exec "${vite_cmd[@]}") &
 vite=$!
 trap 'kill $backend $vite 2>/dev/null || true' EXIT
 

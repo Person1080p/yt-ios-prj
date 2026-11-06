@@ -93,24 +93,40 @@ pub async fn import(state: &AppState, only: Option<&str>, keep_in_sync: bool) ->
     let source = if keep_in_sync { format!("browser:{}", found.browser) } else { "manual".to_string() };
     save(state, &found.cookie, &source).await?;
     state.db.set_setting(ACCOUNT_KEY, &account).await?;
+    let _ = state.db.call(|c| c.execute("DELETE FROM settings WHERE key=?1", [SYNC_ERROR_KEY])).await;
     tracing::info!("imported YouTube Music sign-in ({account}) from {}", found.browser);
     Ok((found.browser, account))
 }
 
-/// Periodically refresh a browser-sourced cookie from the same browser.
+/// Why the last refresh from the browser didn't work (cleared when one does, and on sign-out).
+pub const SYNC_ERROR_KEY: &str = "ytmusic.cookie_sync_error";
+
+/// Periodically refresh a browser-sourced cookie from the same browser. Purely opportunistic:
+/// nothing waits for it, and when the browser can't be read (e.g. it isn't installed where the
+/// server runs) the saved sign-in simply keeps being used for as long as YouTube accepts it.
 pub fn spawn_sync_loop(state: SharedState) {
     tokio::spawn(crate::services::ytlog::with_origin("cookie sync loop", async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
             if let Err(e) = sync_once(&state).await {
-                tracing::warn!("YouTube Music sign-in sync: {e:#}");
+                tracing::info!("couldn't refresh the YouTube Music sign-in from the browser ({e:#}); still using the saved one");
             }
             tokio::time::sleep(SYNC_EVERY).await;
         }
     }));
 }
 
+/// Refresh from the browser, remembering why it failed (shown in Settings) or clearing that.
 pub async fn sync_once(state: &AppState) -> anyhow::Result<bool> {
+    let result = sync_from_browser(state).await;
+    let _ = match &result {
+        Ok(_) => state.db.call(|c| c.execute("DELETE FROM settings WHERE key=?1", [SYNC_ERROR_KEY])).await.map(|_| ()),
+        Err(e) => state.db.set_setting(SYNC_ERROR_KEY, &format!("{e:#}")).await,
+    };
+    result
+}
+
+async fn sync_from_browser(state: &AppState) -> anyhow::Result<bool> {
     let Some(source) = state.db.get_setting(COOKIE_SOURCE_KEY).await? else { return Ok(false) };
     let Some(browser) = source.strip_prefix("browser:") else { return Ok(false) };
     let found = find_session(state, Some(browser)).await?;

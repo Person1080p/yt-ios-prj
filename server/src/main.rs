@@ -37,7 +37,8 @@ async fn main() -> anyhow::Result<()> {
     let (events, _) = broadcast::channel(256);
     let state = Arc::new(AppState {
         yt: YtMusic::new(http.clone(), db.clone()),
-        ytdlp: YtDlp::new(http.clone(), cfg.ytdlp_path.clone(), cfg.data_dir.clone()),
+        ytdlp: YtDlp::new(http.clone(), cfg.ytdlp_path.clone(), cfg.data_dir.clone(), cfg.bin_dir.clone()),
+        audio_cache: Arc::new(services::audiocache::AudioCache::new(&cfg.data_dir, db.clone(), http.clone())),
         plex: Plex::new(http.clone(), db.clone()),
         lastfm: LastFm::new(http.clone(), db.clone(), cfg.lastfm_api_key.clone(), cfg.lastfm_api_secret.clone()),
         queue: Mutex::new(Queue::load(&db).await),
@@ -66,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
     services::ytauth::spawn_sync_loop(state.clone());
     services::importers::spawn_lastfm_sync(state.clone());
     services::cache::spawn_purge_loop(state.db.clone());
+    state.audio_cache.load().await;
+    state.audio_cache.spawn_purge_loop();
 
     let app = routes::router(state.clone());
 

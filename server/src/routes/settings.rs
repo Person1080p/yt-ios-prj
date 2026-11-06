@@ -12,6 +12,7 @@ use crate::{
     error::{ApiResult, AppError},
     routes::base_url,
     services::{
+        audiocache,
         importers,
         playback::{self, PlaybackEvent},
         plex::{PlexPin, PlexServer},
@@ -38,6 +39,7 @@ pub struct Status {
     spotify: Value,
     deezer: Value,
     prefs: Prefs,
+    audio_cache: audiocache::Stats,
     tailscale: TailscaleInfo,
     public_url: String,
 }
@@ -70,6 +72,7 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
             "source": st.db.get_setting(COOKIE_SOURCE_KEY).await?,
             "account": st.db.get_setting(ACCOUNT_KEY).await?,
             "syncedAt": st.db.get_setting(COOKIE_SYNCED_KEY).await?.and_then(|s| s.parse::<i64>().ok()),
+            "syncError": st.db.get_setting(ytauth::SYNC_ERROR_KEY).await?,
         }),
         plex: json!({
             "connected": plex.is_some(),
@@ -88,6 +91,7 @@ pub async fn status(State(st): State<SharedState>, headers: HeaderMap) -> ApiRes
         }),
         deezer: json!({ "userId": st.db.get_setting("deezer.user_id").await? }),
         prefs: load_prefs(&st).await,
+        audio_cache: st.audio_cache.stats().await,
         tailscale: ts,
         public_url: base_url(&st, &headers).await,
     }))
@@ -116,6 +120,13 @@ pub struct Prefs {
     /// Spacing of import/sync requests to YouTube: "normal" | "slow" | "very_slow"
     #[serde(default = "default_pace")]
     import_pace: String,
+    /// Hours MP3 copies of YouTube plays are kept and used (0: off).
+    #[serde(default = "default_cache_hours")]
+    audio_cache_hours: u32,
+}
+
+fn default_cache_hours() -> u32 {
+    audiocache::DEFAULT_HOURS
 }
 
 fn default_pace() -> String {
@@ -145,12 +156,16 @@ async fn load_prefs(st: &SharedState) -> Prefs {
         lastfm_sync: importers::lastfm_sync_mode(&st.db).await,
         log_youtube: ytlog::enabled(),
         import_pace: import_pace(st).await,
+        audio_cache_hours: st.audio_cache.hours(),
     }
 }
 
 pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> ApiResult<Prefs> {
     if pace_base_ms(&p.import_pace).is_none() {
         return Err(AppError::bad("importPace must be original, normal, slow or very_slow"));
+    }
+    if p.audio_cache_hours > audiocache::MAX_HOURS {
+        return Err(AppError::bad(format!("audioCacheHours must be 0 to {}", audiocache::MAX_HOURS)));
     }
     st.db.set_setting("prefs.prefer_plex", if p.prefer_plex { "1" } else { "0" }).await?;
     st.db.set_setting("prefs.scrobble", if p.scrobble { "1" } else { "0" }).await?;
@@ -165,6 +180,7 @@ pub async fn set_prefs(State(st): State<SharedState>, Json(p): Json<Prefs>) -> A
     ytlog::set_enabled(p.log_youtube);
     st.db.set_setting(IMPORT_PACE_KEY, &p.import_pace).await?;
     st.yt.set_pace(&p.import_pace);
+    st.audio_cache.set_hours(p.audio_cache_hours).await?;
     Ok(Json(load_prefs(&st).await))
 }
 

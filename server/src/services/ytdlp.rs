@@ -91,18 +91,30 @@ pub struct YtDlp {
     http: reqwest::Client,
     configured: Option<PathBuf>,
     data_dir: PathBuf,
+    /// Where the managed copy lives (`<data>/bin` unless `YTP_BIN_DIR` says otherwise).
+    bin_dir: PathBuf,
     bin: Mutex<Option<PathBuf>>,
+    /// `--version` output. Starting yt-dlp takes seconds (it unpacks itself), so ask once.
+    version: Mutex<Option<String>>,
     cache: Mutex<HashMap<String, (ResolvedStream, Instant)>>,
 }
 
 impl YtDlp {
-    pub fn new(http: reqwest::Client, configured: Option<PathBuf>, data_dir: PathBuf) -> Self {
-        Self { http, configured, data_dir, bin: Mutex::new(None), cache: Mutex::new(HashMap::new()) }
+    pub fn new(http: reqwest::Client, configured: Option<PathBuf>, data_dir: PathBuf, bin_dir: PathBuf) -> Self {
+        Self {
+            http,
+            configured,
+            data_dir,
+            bin_dir,
+            bin: Mutex::new(None),
+            version: Mutex::new(None),
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
     fn managed_path(&self) -> PathBuf {
         let name = if cfg!(windows) { "yt-dlp.exe" } else { "yt-dlp" };
-        self.data_dir.join("bin").join(name)
+        self.bin_dir.join(name)
     }
 
     /// Returns a usable yt-dlp path, installing it if necessary.
@@ -156,14 +168,23 @@ impl YtDlp {
     }
 
     pub async fn version(&self) -> anyhow::Result<String> {
+        let mut cached = self.version.lock().await;
+        if let Some(v) = cached.as_ref() {
+            return Ok(v.clone());
+        }
         let bin = self.binary().await?;
         let out = Command::new(bin).arg("--version").output().await?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !v.is_empty() {
+            *cached = Some(v.clone());
+        }
+        Ok(v)
     }
 
     /// Self-update. Only works for the managed binary; a system package should be updated by its package manager.
     pub async fn update(&self) -> anyhow::Result<String> {
         let bin = self.binary().await?;
+        *self.version.lock().await = None;
         if bin == self.managed_path() {
             let out = Command::new(&bin).arg("-U").output().await?;
             let mut s = String::from_utf8_lossy(&out.stdout).to_string();

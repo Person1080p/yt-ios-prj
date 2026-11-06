@@ -129,6 +129,12 @@ function YouTubeMusic({ status, reload }: { status: Status; reload: () => void }
             )}
             .
           </p>
+          {synced && yt.syncError && (
+            <p className="small muted">
+              Couldn't refresh it from {synced} on this server ({yt.syncError}). That's fine while it keeps working: the saved
+              sign-in is still used, and YouTube rejecting it is what would need a new sign-in.
+            </p>
+          )}
           <div className="row gap wrap">
             {synced && (
               <button
@@ -460,9 +466,48 @@ function Preferences({ status, reload }: { status: Status; reload: () => void })
           <option value="both">Two-way: library ↔ loved tracks</option>
         </select>
       </label>
+      <AudioCache status={status} hours={p.audioCacheHours} onChange={(h) => update({ audioCacheHours: h })} />
       <AudioQuality />
       <Crossfade />
     </Section>
+  );
+}
+
+const CACHE_HOURS = [
+  [0, "Off"],
+  [1, "1 hour"],
+  [3, "3 hours"],
+  [6, "6 hours"],
+  [12, "12 hours"],
+  [24, "1 day"],
+  [72, "3 days"],
+  [168, "1 week"],
+  [720, "30 days"],
+] as const;
+
+/** Server-wide: MP3 copies of fully loaded YouTube tracks, kept in the server's data folder. */
+function AudioCache({ status, hours, onChange }: { status: Status; hours: number; onChange: (h: number) => void }) {
+  const c = status.audioCache;
+  const options: [number, string][] = CACHE_HOURS.map(([h, l]) => [h, l]);
+  // A value set some other way (e.g. directly in the database) still shows up.
+  if (!options.some(([h]) => h === hours)) options.push([hours, `${hours} hours`]);
+  const size = c.bytes >= 1e9 ? `${(c.bytes / 1e9).toFixed(1)} GB` : `${Math.round(c.bytes / 1e6)} MB`;
+  return (
+    <label className="field">
+      <span className="small">Keep MP3 copies of YouTube plays</span>
+      <select className="input" value={hours} disabled={!c.available} onChange={(e) => onChange(Number(e.target.value))}>
+        {options.map(([h, l]) => (
+          <option key={h} value={h}>
+            {l}
+          </option>
+        ))}
+      </select>
+      <span className="small muted">
+        {c.available
+          ? `Once a song from YouTube has fully loaded at high quality, the server saves it as a tagged MP3 (title, artist, album, cover) and plays that copy instead, shown as “Cached”. ${c.files} saved now (${size}).`
+          : "Needs ffmpeg on the server (install it, or set YTP_FFMPEG), then restart the server."}
+      </span>
+    </label>
   );
 }
 

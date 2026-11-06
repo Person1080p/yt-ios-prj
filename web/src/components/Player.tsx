@@ -1,6 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
-import { api, fmtTime, type Track } from "../lib/api";
+import { api, fmtTime, type AudioSource, type Track } from "../lib/api";
 import { setLiked, useLibrary } from "../lib/library";
 import { next, playRadio, previous, seek, toggle } from "../lib/player";
 import { currentTrack, useStore } from "../lib/store";
@@ -43,15 +43,20 @@ export function HeartButton({ track, size = 22 }: { track: Track; size?: number 
   );
 }
 
+const SOURCE_NAMES: Record<AudioSource, string> = { plex: "Plex", cache: "Cached", youtube: "YouTube" };
+
 function SourceBadge() {
   const source = useStore((s) => s.source);
   const kbps = useStore((s) => s.streamKbps);
   const budget = useStore((s) => s.qualityBudget);
   if (!source) return null;
-  const name = source === "plex" ? "Plex" : "YouTube";
+  const name = SOURCE_NAMES[source];
+  const tip = [source === "cache" ? "MP3 copy the server kept from a recent YouTube play" : "", kbps ? `${kbps} kbps` : ""]
+    .filter(Boolean)
+    .join(" · ");
   // Show the bitrate when quality is being limited for the connection.
   return (
-    <span className={`badge ${source}`} title={kbps ? `${kbps} kbps` : undefined}>
+    <span className={`badge ${source}`} title={tip || undefined}>
       {name}
       {budget != null && kbps ? ` · ${kbps} kbps` : ""}
     </span>

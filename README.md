@@ -5,6 +5,7 @@ A self-hosted music player that you install as a PWA on your phone. The backend 
 - **YouTube Music**: search, home feed (mixes, Quick picks, Supermix), playlists and albums, plus automatic "radio" queues.
 - **yt-dlp**: managed by the server. It resolves audio and proxies it with HTTP Range support, so seeking works. If direct URLs are blocked, it falls back to piping yt-dlp's output.
 - **YouTube history**: tracks you listen to are reported to your YouTube watch history, which feeds YouTube Music's own recommendations.
+- **Audio cache**: once a track played from YouTube at high quality has fully loaded, the server converts the audio it already passed through to an MP3 tagged with the song's title, artist, album and cover art (needs `ffmpeg`), and keeps it in `server/data/audio-cache/` as `Artist - Title [videoId].mp3`. Plays during that time come from the copy, shown as **Cached** in the player. How long copies are kept (3 hours by default, or off) is set in **Settings → Playback**.
 - **Plex / Plexamp**: if a track also exists in your Plex library, it streams from Plex instead. Codecs the browser can't play are transcoded to MP3.
 - **Last.fm**: now-playing updates, scrobbling with offline retry, loves, and similar-track recommendations blended into radio and autoplay.
 - **Queue**: kept on the server and shared live across devices over SSE. It supports play now / play next / add to queue, drag-to-reorder, shuffle, autoplay top-up, and saving as a playlist.

@@ -131,7 +131,7 @@ export default function QueuePage() {
               trailing={
                 <span className="muted small" title={h.scrobbled ? "Scrobbled" : ""}>
                   {new Date(h.playedAt * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                  {h.source === "plex" ? " · Plex" : ""}
+                  {h.source === "plex" ? " · Plex" : h.source === "cache" ? " · Cached" : ""}
                   {h.scrobbled ? " ✓" : ""}
                 </span>
               }

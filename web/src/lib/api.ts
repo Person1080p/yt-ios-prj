@@ -52,6 +52,9 @@ export type ImportJob = {
   finishedAt?: number | null;
 };
 
+/** Where a track's audio comes from: the Plex library, a recent MP3 copy kept by the server, or YouTube. */
+export type AudioSource = "plex" | "cache" | "youtube";
+
 export type HistoryEntry = { playedAt: number; source: string; scrobbled: boolean; track: Track };
 
 export type ProfileInfo = { active: "main" | "fresh"; freshPlays: number; freshStartedAt?: number | null };
@@ -66,6 +69,8 @@ export type Prefs = {
   logYoutube: boolean;
   /** Spacing of import/sync requests to YouTube. */
   importPace: "original" | "normal" | "slow" | "very_slow";
+  /** Hours the server keeps and plays MP3 copies of fully loaded YouTube tracks (0: off). */
+  audioCacheHours: number;
 };
 
 export type YtLogEntry = {
@@ -129,12 +134,16 @@ export type Status = {
     source?: string | null;
     account?: string | null;
     syncedAt?: number | null;
+    /** Why the last refresh from the server's browser failed; the saved sign-in is still used. */
+    syncError?: string | null;
   };
   plex: { connected: boolean; url?: string | null; loggedIn: boolean };
   lastfm: { configured: boolean; keysFromEnv: boolean; connected: boolean; username?: string | null };
   spotify: { configured: boolean; connected: boolean };
   deezer: { userId?: string | null };
   prefs: Prefs;
+  /** MP3 copies of YouTube plays kept on the server. `available`: ffmpeg was found. */
+  audioCache: { available: boolean; hours: number; files: number; bytes: number };
   tailscale: TailscaleInfo;
   publicUrl: string;
 };
@@ -215,7 +224,7 @@ export const api = {
   playlist: (id: string) => req<Track[]>(`/playlist/${enc(id)}`),
   recommendations: (videoId: string) => req<Track[]>(`/recommendations/${enc(videoId)}`),
   source: (videoId: string) =>
-    req<{ source: "plex" | "youtube"; kbps?: number | null }>(withArgs(`/tracks/${enc(videoId)}/source`, qualityArgs())),
+    req<{ source: AudioSource; kbps?: number | null }>(withArgs(`/tracks/${enc(videoId)}/source`, qualityArgs())),
   liked: (videoId: string) => req<LikedState>(`/tracks/${enc(videoId)}/liked`),
   setLiked: (track: Track, liked: boolean) =>
     req<LikedState>(`/tracks/${enc(track.videoId)}/liked`, { method: "PUT", body: { track, liked } }),

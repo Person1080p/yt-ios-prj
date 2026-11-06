@@ -1,7 +1,11 @@
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    println!("cargo:rerun-if-changed=vendor/yt-dlp");
+    // Only watch vendor/yt-dlp when it's embedded: cargo treats a missing watched file as changed,
+    // which would rerun this script (and the Go build below) and relink the server on every build.
+    if env::var("CARGO_FEATURE_EMBED_YTDLP").is_ok() {
+        println!("cargo:rerun-if-changed=vendor/yt-dlp");
+    }
     for f in ["tsnet-ffi/main.go", "tsnet-ffi/go.mod", "tsnet-ffi/go.sum"] {
         println!("cargo:rerun-if-changed={f}");
     }

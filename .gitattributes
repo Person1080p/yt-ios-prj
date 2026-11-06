@@ -1,0 +1,5 @@
+# The working tree is shared between Linux and Windows (WSL): keep LF so shell scripts run
+# everywhere, and CRLF only for Windows batch files.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
