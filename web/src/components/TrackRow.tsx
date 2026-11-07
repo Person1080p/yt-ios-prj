@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { fmtTime, type Track } from "../lib/api";
 import { currentTrack, useStore } from "../lib/store";
+import { usePressMenu } from "../lib/pressMenu";
 import { isTailnet } from "../lib/transport";
 import { MoreIcon } from "./Icons";
 
@@ -35,10 +36,11 @@ export function TrackRow({ track, onPlay, active, leading, trailing, dim }: Prop
   const openMenu = useStore((s) => s.openMenu);
   const playingId = useStore((s) => currentTrack(s)?.videoId);
   const isActive = active ?? playingId === track.videoId;
+  const press = usePressMenu(() => openMenu(track));
   return (
     <div className={`track-row ${isActive ? "active" : ""} ${dim ? "dim" : ""}`}>
       {leading}
-      <button className="track-main" onClick={onPlay}>
+      <button className="track-main" onClick={onPlay} {...press}>
         <Cover src={track.thumbnail} />
         <div className="track-text">
           <div className="track-title">{track.title}</div>

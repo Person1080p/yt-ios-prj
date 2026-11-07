@@ -1,6 +1,6 @@
 //! Audio delivery. Plex is preferred when the same track exists in the library; then a recent
 //! MP3 copy of a YouTube play (see services::audiocache); otherwise audio comes from YouTube
-//! through yt-dlp.
+//! through yt-dlp. Songs that are only in Plex (`plex_<ratingKey>` ids) always come from Plex.
 
 use axum::{
     body::Body,
@@ -17,7 +17,11 @@ use tower_http::services::ServeFile;
 use crate::{
     error::{ApiResult, AppError},
     routes::music::track_or_fetch,
-    services::{audiocache, plex::PlexTrack, ytdlp::AudioLevel},
+    services::{
+        audiocache,
+        plex::{self, PlexTrack},
+        ytdlp::AudioLevel,
+    },
     state::SharedState,
 };
 
@@ -55,7 +59,22 @@ impl QualityQuery {
     }
 }
 
+/// A Plex-only song when Plex can't play it (server unreachable, disconnected, or file gone).
+fn plex_only_unavailable() -> AppError {
+    AppError::NotConfigured("This song is only in your Plex library, and Plex can't play it right now".into())
+}
+
 async fn plex_match(st: &SharedState, video_id: &str) -> Option<PlexTrack> {
+    if plex::is_plex_id(video_id) {
+        // Only in Plex: play it whether or not "Prefer Plex" is on.
+        return match st.plex.track_for_id(video_id).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("plex lookup failed for {video_id}: {e:#}");
+                None
+            }
+        };
+    }
     if !st.plex.enabled().await {
         return None;
     }
@@ -77,6 +96,9 @@ pub async fn source(
     if let Some(pt) = plex_match(&st, &video_id).await {
         let kbps = st.plex.stream_url(&pt, q.kbps).await.ok().map(|(_, k)| k);
         return Ok(Json(SourceInfo { source: "plex".into(), plex: Some(pt), kbps }));
+    }
+    if plex::is_plex_id(&video_id) {
+        return Err(plex_only_unavailable());
     }
     if st.audio_cache.peek(&video_id, q.cache_ok()) {
         return Ok(Json(SourceInfo { source: "cache".into(), plex: None, kbps: Some(audiocache::KBPS) }));
@@ -119,14 +141,19 @@ pub async fn stream(
     let range = headers.get(header::RANGE).cloned();
     let quality = q.quality();
 
-    if q.via.is_none() {
+    let plex_only = plex::is_plex_id(&video_id);
+    if q.via.is_none() || plex_only {
         if let Some(pt) = plex_match(&st, &video_id).await {
             let (url, kbps) = st.plex.stream_url(&pt, quality.kbps).await?;
             match proxy(&st.http, &url, range.clone(), &[], None, None).await {
                 Ok(resp) => return Ok(with_kbps(with_source(resp, "plex"), Some(kbps))),
+                Err(e) if plex_only => tracing::warn!("plex stream failed for {video_id}: {e:#}"),
                 Err(e) => tracing::warn!("plex stream failed, falling back to youtube: {e:#}"),
             }
         }
+    }
+    if plex_only {
+        return Err(plex_only_unavailable());
     }
 
     if q.via.as_deref() != Some("pipe") {

@@ -2,7 +2,8 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{header, HeaderMap, HeaderValue},
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -10,12 +11,13 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{ApiResult, AppError},
+    models::Track,
     routes::base_url,
     services::{
         audiocache,
         importers,
         playback::{self, PlaybackEvent},
-        plex::{PlexPin, PlexServer},
+        plex::{self, PlexPin, PlexServer, PlexTrack},
         tailscale::{self, TailscaleInfo},
         ytauth, ytlog,
         ytmusic::{pace_base_ms, ACCOUNT_KEY, DEFAULT_IMPORT_PACE, IMPORT_PACE_KEY, COOKIE_SOURCE_KEY, COOKIE_SYNCED_KEY},
@@ -314,6 +316,52 @@ pub async fn plex_set_server(State(st): State<SharedState>, Json(b): Json<PlexSe
 pub async fn plex_disconnect(State(st): State<SharedState>) -> ApiResult<Value> {
     st.plex.disconnect().await?;
     Ok(ok())
+}
+
+#[derive(Deserialize)]
+pub struct PlexSearchQuery {
+    q: String,
+}
+
+/// Tracks on the Plex server, as songs with Plex-only ids (for picking a library match).
+pub async fn plex_search(State(st): State<SharedState>, Query(q): Query<PlexSearchQuery>) -> ApiResult<Vec<Track>> {
+    if st.plex.server().await.is_none() {
+        return Err(AppError::NotConfigured("Connect Plex in Settings first".into()));
+    }
+    let hits = st.plex.search(q.q.trim()).await.map_err(|e| AppError::bad(format!("Plex search failed: {e:#}")))?;
+    Ok(Json(hits.iter().map(|h| h.to_track()).collect()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexMatchBody {
+    rating_key: String,
+}
+
+/// Play a YouTube-matched song from a Plex track of your choosing.
+pub async fn plex_set_match(
+    State(st): State<SharedState>,
+    Path(video_id): Path<String>,
+    Json(b): Json<PlexMatchBody>,
+) -> ApiResult<PlexTrack> {
+    if plex::is_plex_id(&video_id) {
+        return Err(AppError::bad("that song is already a Plex track"));
+    }
+    let t = st.plex.pin(&video_id, &b.rating_key).await.map_err(|e| AppError::bad(format!("{e:#}")))?;
+    Ok(Json(t))
+}
+
+#[derive(Deserialize)]
+pub struct PlexArtQuery {
+    path: String,
+}
+
+/// Artwork of Plex tracks (the server needs its token, which browsers don't get).
+pub async fn plex_art(State(st): State<SharedState>, Query(q): Query<PlexArtQuery>) -> Result<Response, AppError> {
+    let bytes = st.plex.art(&q.path).await.map_err(|e| AppError::bad(format!("{e:#}")))?;
+    let mut resp = crate::routes::art::image_response(bytes);
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
+    Ok(resp)
 }
 
 // ---- Spotify ----------------------------------------------------------------------

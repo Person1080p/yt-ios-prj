@@ -16,6 +16,8 @@ type State = {
   qualityBudget: number | null;
   /** Measured speed of the connection to the server (kbps), once measured. */
   netKbps: number | null;
+  /** Master volume on this device, 0–1 (always 1 on phones and tablets). See player.ts. */
+  volume: number;
   nowPlayingOpen: boolean;
   menuTrack: Track | null;
   playlistPickerTracks: Track[] | null;
@@ -40,6 +42,7 @@ export const useStore = create<State>((set, get) => ({
   streamKbps: null,
   qualityBudget: null,
   netKbps: null,
+  volume: 1,
   nowPlayingOpen: false,
   menuTrack: null,
   playlistPickerTracks: null,

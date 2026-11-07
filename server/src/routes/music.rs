@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ApiResult, AppError},
     models::{ArtistPage, GridPage, SearchResults, Shelf, Track},
-    services::recommend,
+    services::{matching, plex, recommend, ytmusic::HeaderInfo},
     state::SharedState,
 };
 
@@ -53,8 +53,18 @@ pub async fn search(State(st): State<SharedState>, Query(q): Query<SearchQuery>)
 }
 
 pub async fn radio(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<Vec<Track>> {
-    let tracks = st.yt.watch_playlist(Some(&video_id), None, 50).await?;
+    if !plex::is_plex_id(&video_id) {
+        let tracks = st.yt.watch_playlist(Some(&video_id), None, 50).await?;
+        st.db.upsert_tracks(tracks.clone()).await?;
+        return Ok(Json(tracks));
+    }
+    // A Plex-only song: radio from its closest YouTube equivalent, led by the song itself.
+    let seed = track_or_fetch(&st, &video_id).await?;
+    let Some(id) = recommend::youtube_seed(&st, &seed).await else { return Ok(Json(vec![seed])) };
+    let mut tracks = st.yt.watch_playlist(Some(&id), None, 50).await?;
     st.db.upsert_tracks(tracks.clone()).await?;
+    tracks.retain(|t| t.video_id != id);
+    tracks.insert(0, seed);
     Ok(Json(tracks))
 }
 
@@ -62,6 +72,12 @@ pub async fn playlist(State(st): State<SharedState>, Path(id): Path<String>) -> 
     let tracks = st.yt.playlist_tracks(&id, 500).await?;
     st.db.upsert_tracks(tracks.clone()).await?;
     Ok(Json(tracks))
+}
+
+/// A playlist's or album's name, owner/artist and cover.
+pub async fn playlist_info(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<HeaderInfo> {
+    valid_browse_id(&id)?;
+    Ok(Json(st.yt.playlist_info(&id).await?))
 }
 
 #[derive(Deserialize)]
@@ -89,7 +105,10 @@ pub async fn track_or_fetch(st: &SharedState, video_id: &str) -> Result<Track, A
     if let Some(t) = st.db.get_track(video_id).await? {
         return Ok(t);
     }
-    let t = st.yt.song_info(video_id).await?;
+    let t = match plex::rating_key(video_id) {
+        Some(rk) => st.plex.track_by_key(rk).await?.ok_or(AppError::NotFound)?.to_track(),
+        None => st.yt.song_info(video_id).await?,
+    };
     st.db.upsert_tracks(vec![t.clone()]).await?;
     Ok(t)
 }
@@ -149,13 +168,59 @@ pub async fn search_all(State(st): State<SharedState>, Query(q): Query<SearchAll
         return Ok(Json(SearchResults::default()));
     }
     let res = match q.filter.as_deref() {
-        Some("songs") => SearchResults { songs: st.yt.search_songs(&q.q, 30).await?, ..Default::default() },
-        f => st.yt.search_all(&q.q, f).await?,
+        Some("songs") => st.yt.search_songs(&q.q, 30).await.map(|songs| SearchResults { songs, ..Default::default() }),
+        f => st.yt.search_all(&q.q, f).await,
+    };
+    let res = match res {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("youtube search failed, searching plex and the audio cache: {e:#}");
+            return Ok(Json(offline_search(&st, &q.q, &format!("{e:#}")).await));
+        }
     };
     let mut tracks = res.songs.clone();
     tracks.extend(res.top.iter().filter_map(|t| t.track.clone()));
     st.db.upsert_tracks(tracks).await?;
     Ok(Json(res))
+}
+
+/// Songs that play without YouTube: Plex tracks, and songs with an MP3 in the audio cache.
+async fn offline_search(st: &SharedState, query: &str, error: &str) -> SearchResults {
+    let words: Vec<String> = matching::normalize(query).split_whitespace().map(String::from).collect();
+    let matches = |t: &Track| {
+        let hay = matching::normalize(&format!("{} {} {}", t.artist, t.title, t.album.as_deref().unwrap_or_default()));
+        words.iter().all(|w| hay.contains(w.as_str()))
+    };
+
+    let mut songs = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if st.plex.server().await.is_some() {
+        match st.plex.search(query).await {
+            Ok(hits) => {
+                // Plex's search is loose (it matches on parts of words and on other fields); keep
+                // what contains every word typed, like the cache results.
+                for h in hits {
+                    let t = h.to_track();
+                    let with_album_artist = Track { artist: format!("{} {}", t.artist, h.album_artist), ..t.clone() };
+                    if matches(&with_album_artist) {
+                        seen.insert(format!("{}|{}", matching::normalize(&t.artist), matching::normalize(&t.title)));
+                        songs.push(t);
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("plex search failed too: {e:#}"),
+        }
+    }
+    for vid in st.audio_cache.fresh_ids() {
+        let Ok(Some(t)) = st.db.get_track(&vid).await else { continue };
+        // Plex has it already: Plex plays better.
+        if matches(&t) && seen.insert(format!("{}|{}", matching::normalize(&t.artist), matching::normalize(&t.title))) {
+            songs.push(t);
+        }
+    }
+    let _ = st.db.upsert_tracks(songs.clone()).await;
+    let brief = error.lines().next().unwrap_or(error).chars().take(160).collect::<String>();
+    SearchResults { songs, fallback: Some(brief), ..Default::default() }
 }
 
 fn valid_browse_id(id: &str) -> Result<(), AppError> {

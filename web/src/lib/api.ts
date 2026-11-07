@@ -28,6 +28,8 @@ export type Shelf = { title: string; items: HomeItem[] };
 
 export type PlaylistSummary = { id: number; name: string; count: number; updatedAt: number; thumbnail?: string | null };
 export type Playlist = { id: number; name: string; tracks: Track[] };
+/** A YouTube Music playlist (or album) linked on the Playlists page; opened live, not copied. */
+export type LinkedPlaylist = { id: string; title: string; subtitle?: string | null; thumbnail?: string | null; addedAt: number };
 
 export type LikedEntry = {
   id: number;
@@ -187,6 +189,9 @@ async function req<T>(
 
 const enc = encodeURIComponent;
 
+/** Songs that are only in Plex use `plex_<ratingKey>` in place of a YouTube video id. */
+export const isPlexId = (videoId: string) => /^plex_\d+$/.test(videoId);
+
 export type SearchResults = {
   top: HomeItem | null;
   songs: Track[];
@@ -194,6 +199,8 @@ export type SearchResults = {
   albums: HomeItem[];
   playlists: HomeItem[];
   videos: Track[];
+  /** YouTube's search failed (this says why): the songs are from Plex and the audio cache. */
+  fallback?: string;
 };
 export type SearchFilter = "songs" | "artists" | "albums";
 export type BrowseRef = { browseId: string; params?: string | null };
@@ -223,6 +230,9 @@ export const api = {
     req<GridPage>(`/browse/grid?id=${enc(id)}${params ? `&params=${enc(params)}` : ""}`),
   radio: (videoId: string) => req<Track[]>(`/radio/${enc(videoId)}`),
   playlist: (id: string) => req<Track[]>(`/playlist/${enc(id)}`),
+  track: (videoId: string) => req<Track>(`/tracks/${enc(videoId)}`),
+  playlistInfo: (id: string) =>
+    req<{ title?: string | null; artist?: string | null; thumbnail?: string | null }>(`/playlist/${enc(id)}/info`),
   recommendations: (videoId: string) => req<Track[]>(`/recommendations/${enc(videoId)}`),
   source: (videoId: string) =>
     req<{ source: AudioSource; kbps?: number | null }>(withArgs(`/tracks/${enc(videoId)}/source`, qualityArgs())),
@@ -259,6 +269,10 @@ export const api = {
     update: (id: number, body: { name?: string; tracks?: Track[]; append?: Track[] }) =>
       req<Playlist>(`/playlists/${id}`, { method: "PUT", body }),
     remove: (id: number) => req<{ ok: boolean }>(`/playlists/${id}`, { method: "DELETE" }),
+    /** YouTube Music playlists and albums linked on the Playlists page. */
+    linked: () => req<LinkedPlaylist[]>("/linked-playlists"),
+    link: (p: Omit<LinkedPlaylist, "addedAt">) => req<LinkedPlaylist>("/linked-playlists", { body: p }),
+    unlink: (id: string) => req<{ ok: boolean }>(`/linked-playlists/${enc(id)}`, { method: "DELETE" }),
   },
 
   library: {
@@ -317,6 +331,11 @@ export const api = {
   plexServers: () => req<PlexServer[]>("/plex/servers"),
   plexSetServer: (url: string, token: string) => req<{ ok: boolean }>("/plex/server", { method: "PUT", body: { url, token } }),
   plexDisconnect: () => req<{ ok: boolean }>("/plex", { method: "DELETE" }),
+  /** Plex tracks as songs; their ids are `plex_<ratingKey>`. */
+  plexSearch: (q: string) => req<Track[]>(`/plex/search?q=${enc(q)}`),
+  /** Play a YouTube-matched song from this Plex track. */
+  plexSetMatch: (videoId: string, ratingKey: string) =>
+    req<{ ratingKey: string }>(`/plex/matches/${enc(videoId)}`, { method: "PUT", body: { ratingKey } }),
   spotifyDisconnect: () => req<{ ok: boolean }>("/spotify", { method: "DELETE" }),
   authCheck: () => req<{ authenticated: boolean; required: boolean }>("/auth/check"),
   login: (token: string) => req<{ ok: boolean }>("/auth/login", { body: { token } }),

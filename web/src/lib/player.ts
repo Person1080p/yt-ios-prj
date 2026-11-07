@@ -62,6 +62,42 @@ export function setCrossfade(seconds: number) {
   }
 }
 
+// ---- volume (per device) ------------------------------------------------------------------
+
+const VOLUME_KEY = "ytp.volume";
+/**
+ * Whether this device gets a volume slider. Phones and tablets (touch only) always play at full
+ * volume and leave the level to their volume buttons; iOS ignores page volume anyway.
+ */
+export const volumeAdjustable =
+  crossfadeSupported && !(typeof matchMedia === "function" && matchMedia("(hover: none) and (pointer: coarse)").matches);
+function readVolume() {
+  if (!volumeAdjustable) return 1;
+  try {
+    const raw = localStorage.getItem(VOLUME_KEY);
+    const n = raw == null ? 1 : Number(raw);
+    return isFinite(n) ? Math.max(0, Math.min(1, n)) : 1;
+  } catch {
+    return 1;
+  }
+}
+/** Master volume, 0–1. Element volumes (crossfades included) are scaled by it. */
+let volume = readVolume();
+for (const el of els) el.volume = volume;
+useStore.setState({ volume });
+export function setVolume(v: number) {
+  if (!volumeAdjustable) return;
+  volume = Math.max(0, Math.min(1, v));
+  try {
+    localStorage.setItem(VOLUME_KEY, String(volume));
+  } catch {
+    /* private mode: keep it for this session */
+  }
+  useStore.setState({ volume });
+  // A running crossfade picks the new level up on its next step.
+  if (!fade) audio.volume = volume;
+}
+
 let loadedUid: string | null = null;
 /** Track primed synchronously inside a user gesture, before the server confirmed the queue change. */
 let pendingVideoId: string | null = null;
@@ -421,7 +457,7 @@ function activate(el: HTMLAudioElement, videoId: string, autoplay: boolean, fade
     el.volume = 0;
     startFade(old, el, fadeSeconds);
   } else {
-    el.volume = 1;
+    el.volume = volume;
     if (old !== el) {
       old.pause();
       resetEl(old);
@@ -511,8 +547,8 @@ function startFade(old: HTMLAudioElement, neu: HTMLAudioElement, seconds: number
     }
     const t = Math.min(1, (performance.now() - start) / ms);
     // Equal-power curve: the overall loudness stays even through the fade.
-    neu.volume = Math.sin((t * Math.PI) / 2);
-    old.volume = Math.cos((t * Math.PI) / 2);
+    neu.volume = volume * Math.sin((t * Math.PI) / 2);
+    old.volume = volume * Math.cos((t * Math.PI) / 2);
     if (t >= 1 || old.ended) endFade();
   };
   fade = { old, neu, timer: setInterval(step, 50) };
@@ -523,9 +559,9 @@ function endFade() {
   const { old, neu, timer } = fade;
   fade = null;
   clearInterval(timer);
-  neu.volume = 1;
+  neu.volume = volume;
   old.pause();
-  old.volume = 1;
+  old.volume = volume;
   resetEl(old);
   maybePreload();
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, type Playlist, type PlaylistSummary } from "../lib/api";
+import { api, type LinkedPlaylist, type Playlist, type PlaylistSummary } from "../lib/api";
 import { enqueue, playTracks } from "../lib/player";
 import { useStore } from "../lib/store";
 import { BackIcon, CloseIcon, PlayIcon, PlusIcon, QueueIcon, ShuffleIcon, TrashIcon } from "../components/Icons";
@@ -8,10 +8,19 @@ import { Cover, TrackRow } from "../components/TrackRow";
 
 export function PlaylistsPage() {
   const [lists, setLists] = useState<PlaylistSummary[] | null>(null);
+  const [linked, setLinked] = useState<LinkedPlaylist[]>([]);
   const [name, setName] = useState("");
   const queue = useStore((s) => s.queue);
   const toast = useStore((s) => s.toastMsg);
-  const load = () => api.playlists.list().then(setLists).catch((e) => toast(e.message));
+  const load = () => {
+    api.playlists.list().then(setLists).catch((e) => toast(e.message));
+    api.playlists.linked().then(setLinked).catch(() => {});
+  };
+  const unlink = async (p: LinkedPlaylist) => {
+    await api.playlists.unlink(p.id);
+    setLinked((cur) => cur.filter((x) => x.id !== p.id));
+    toast(`Removed “${p.title}” from Playlists`);
+  };
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -54,6 +63,32 @@ export function PlaylistsPage() {
         ))}
       </div>
       {lists?.length === 0 && <p className="muted">No playlists yet. Use ⋯ → “Add to playlist” on any track.</p>}
+
+      {linked.length > 0 && (
+        <section className="shelf">
+          <div className="shelf-head">
+            <h2>From YouTube Music</h2>
+          </div>
+          <p className="small muted">Linked playlists and albums open from YouTube Music, so they stay up to date.</p>
+          <div className="grid">
+            {linked.map((p) => (
+              <div key={p.id} className="linked-card">
+                <Link to={`/collection/${encodeURIComponent(p.id)}?title=${encodeURIComponent(p.title)}`} className="card-btn">
+                  <Cover src={p.thumbnail} size={148} />
+                  <div className="card-title">{p.title}</div>
+                  <div className="card-sub">{p.subtitle || (p.id.startsWith("MPRE") ? "Album" : "Playlist")}</div>
+                </Link>
+                <button className="icon-btn linked-remove" aria-label={`Remove ${p.title} from Playlists`} title="Remove from Playlists" onClick={() => unlink(p)}>
+                  <CloseIcon size={16} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+      {lists && linked.length === 0 && (
+        <p className="small muted">Open a playlist or album from Home or Search and use “Link in Playlists” to keep it here.</p>
+      )}
     </div>
   );
 }

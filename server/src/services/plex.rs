@@ -31,6 +31,64 @@ pub struct PlexTrack {
     pub artist: String,
 }
 
+/// Songs that are only in Plex (no YouTube match) use `plex_<ratingKey>` where other songs use
+/// their YouTube video id. Such ids never reach YouTube: playback is Plex only.
+pub const ID_PREFIX: &str = "plex_";
+
+/// The rating key in a Plex-only id.
+pub fn rating_key(video_id: &str) -> Option<&str> {
+    video_id.strip_prefix(ID_PREFIX).filter(|k| !k.is_empty() && k.len() <= 15 && k.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub fn is_plex_id(video_id: &str) -> bool {
+    rating_key(video_id).is_some()
+}
+
+/// A track found on the Plex server, with what matching and display need.
+#[derive(Debug, Clone)]
+pub struct PlexHit {
+    pub track: PlexTrack,
+    pub duration: Option<u32>,
+    pub album_artist: String,
+    pub album: Option<String>,
+    /// Plex artwork path (served through `/api/plex/art`).
+    pub thumb: Option<String>,
+}
+
+impl PlexHit {
+    /// From a track's Plex metadata JSON.
+    fn parse(m: &Value) -> Option<Self> {
+        let media = &m["Media"][0];
+        let part_key = media["Part"][0]["key"].as_str()?;
+        let album_artist = m["grandparentTitle"].as_str().unwrap_or_default().to_string();
+        Some(Self {
+            track: PlexTrack {
+                rating_key: m["ratingKey"].as_str().unwrap_or_default().into(),
+                part_key: part_key.into(),
+                codec: media["audioCodec"].as_str().map(String::from),
+                title: m["title"].as_str().unwrap_or_default().into(),
+                artist: m["originalTitle"].as_str().map(String::from).unwrap_or_else(|| album_artist.clone()),
+            },
+            duration: m["duration"].as_u64().map(|ms| (ms / 1000) as u32),
+            album_artist,
+            album: m["parentTitle"].as_str().filter(|s| !s.is_empty()).map(String::from),
+            thumb: m["thumb"].as_str().or_else(|| m["parentThumb"].as_str()).map(String::from),
+        })
+    }
+
+    /// As a song in the app, under its Plex-only id.
+    pub fn to_track(&self) -> Track {
+        Track {
+            video_id: format!("{ID_PREFIX}{}", self.track.rating_key),
+            title: self.track.title.clone(),
+            artist: self.track.artist.clone(),
+            album: self.album.clone(),
+            duration: self.duration,
+            thumbnail: self.thumb.as_deref().map(|p| format!("/api/plex/art?path={}", urlencoding::encode(p))),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlexPin {
@@ -197,7 +255,7 @@ impl Plex {
 
     // ---- matching ---------------------------------------------------------
 
-    pub async fn search(&self, query: &str) -> anyhow::Result<Vec<(PlexTrack, Option<u32>, String)>> {
+    pub async fn search(&self, query: &str) -> anyhow::Result<Vec<PlexHit>> {
         let Some((url, token)) = self.server().await else { bail!("plex not configured") };
         let v: Value = self
             .http
@@ -216,34 +274,73 @@ impl Plex {
             if hub["type"].as_str() != Some("track") {
                 continue;
             }
-            for m in hub["Metadata"].as_array().into_iter().flatten() {
-                let media = &m["Media"][0];
-                let Some(part_key) = media["Part"][0]["key"].as_str() else { continue };
-                let artist = m["originalTitle"]
-                    .as_str()
-                    .or_else(|| m["grandparentTitle"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                out.push((
-                    PlexTrack {
-                        rating_key: m["ratingKey"].as_str().unwrap_or_default().into(),
-                        part_key: part_key.into(),
-                        codec: media["audioCodec"].as_str().map(String::from),
-                        title: m["title"].as_str().unwrap_or_default().into(),
-                        artist,
-                    },
-                    m["duration"].as_u64().map(|ms| (ms / 1000) as u32),
-                    m["grandparentTitle"].as_str().unwrap_or_default().to_string(),
-                ));
-            }
+            out.extend(hub["Metadata"].as_array().into_iter().flatten().filter_map(PlexHit::parse));
         }
         Ok(out)
     }
 
-    /// Find the Plex copy of a YouTube track, with a persistent cache.
-    pub async fn find_match(&self, track: &Track) -> anyhow::Result<Option<PlexTrack>> {
-        let vid = track.video_id.clone();
-        let cached = self
+    /// A track by its rating key (None when the server no longer has it).
+    pub async fn track_by_key(&self, rating_key: &str) -> anyhow::Result<Option<PlexHit>> {
+        let Some((url, token)) = self.server().await else { bail!("plex not configured") };
+        let resp = self
+            .http
+            .get(format!("{url}/library/metadata/{}", urlencoding::encode(rating_key)))
+            .header("accept", "application/json")
+            .header("X-Plex-Token", token)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let v: Value = resp.error_for_status()?.json().await?;
+        Ok(v["MediaContainer"]["Metadata"].as_array().and_then(|a| a.first()).and_then(PlexHit::parse))
+    }
+
+    /// The Plex track behind a Plex-only id (`plex_<ratingKey>`), cached like matches.
+    pub async fn track_for_id(&self, video_id: &str) -> anyhow::Result<Option<PlexTrack>> {
+        let Some(rk) = rating_key(video_id) else { return Ok(None) };
+        if let Some((true, Some(t), _)) = self.cached(video_id).await? {
+            return Ok(Some(t));
+        }
+        let found = self.track_by_key(rk).await?.map(|h| h.track);
+        if found.is_some() {
+            self.store(video_id, found.as_ref()).await?;
+        }
+        Ok(found)
+    }
+
+    /// Play `video_id` (a YouTube track) from this Plex track, whatever automatic matching thinks.
+    pub async fn pin(&self, video_id: &str, rating_key: &str) -> anyhow::Result<PlexTrack> {
+        let Some(hit) = self.track_by_key(rating_key).await? else { bail!("that track is no longer on the Plex server") };
+        self.store(video_id, Some(&hit.track)).await?;
+        Ok(hit.track)
+    }
+
+    /// Artwork from the Plex server, resized. `path` is a Plex thumb path from [`PlexHit`].
+    pub async fn art(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        if !path.starts_with("/library/metadata/") || path.contains("..") {
+            bail!("not a plex artwork path");
+        }
+        let Some((url, token)) = self.server().await else { bail!("plex not configured") };
+        let bytes = self
+            .http
+            .get(format!("{url}/photo/:/transcode"))
+            .query(&[("width", "400"), ("height", "400"), ("minSize", "1"), ("upscale", "1"), ("url", path)])
+            .header("X-Plex-Token", token)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// (matched, track, checked_at) from the match cache.
+    async fn cached(&self, video_id: &str) -> anyhow::Result<Option<(bool, Option<PlexTrack>, i64)>> {
+        let vid = video_id.to_string();
+        let row = self
             .db
             .call(move |c| {
                 c.query_row(
@@ -264,15 +361,26 @@ impl Plex {
                 .optional()
             })
             .await?;
-        if let Some((matched, rk, pk, codec, title, artist, checked)) = cached {
+        Ok(row.map(|(matched, rk, pk, codec, title, artist, checked)| {
+            let track = matched.then(|| PlexTrack {
+                rating_key: rk.unwrap_or_default(),
+                part_key: pk.unwrap_or_default(),
+                codec,
+                title: title.unwrap_or_default(),
+                artist: artist.unwrap_or_default(),
+            });
+            (matched, track, checked)
+        }))
+    }
+
+    /// Find the Plex copy of a YouTube track, with a persistent cache.
+    pub async fn find_match(&self, track: &Track) -> anyhow::Result<Option<PlexTrack>> {
+        if is_plex_id(&track.video_id) {
+            return self.track_for_id(&track.video_id).await;
+        }
+        if let Some((matched, t, checked)) = self.cached(&track.video_id).await? {
             if matched {
-                return Ok(Some(PlexTrack {
-                    rating_key: rk.unwrap_or_default(),
-                    part_key: pk.unwrap_or_default(),
-                    codec,
-                    title: title.unwrap_or_default(),
-                    artist: artist.unwrap_or_default(),
-                }));
+                return Ok(t);
             }
             if now() - checked < NEGATIVE_TTL {
                 return Ok(None);
@@ -286,16 +394,23 @@ impl Plex {
         }
         let best = candidates
             .into_iter()
-            .map(|(pt, dur, album_artist)| {
-                let s1 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &pt.artist, dur);
-                let s2 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &album_artist, dur);
+            .map(|h| {
+                let pt = h.track;
+                let s1 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &pt.artist, h.duration);
+                let s2 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &h.album_artist, h.duration);
                 (s1.max(s2), pt)
             })
             .max_by(|a, b| a.0.total_cmp(&b.0));
 
         let result = best.filter(|(s, _)| *s >= MATCH_THRESHOLD).map(|(_, t)| t);
-        let vid = track.video_id.clone();
-        let r = result.clone();
+        self.store(&track.video_id, result.as_ref()).await?;
+        Ok(result)
+    }
+
+    /// Save a match (or that there is none) for `video_id`.
+    async fn store(&self, video_id: &str, track: Option<&PlexTrack>) -> anyhow::Result<()> {
+        let vid = video_id.to_string();
+        let r = track.cloned();
         self.db
             .call(move |c| {
                 c.execute(
@@ -314,8 +429,7 @@ impl Plex {
                 )
                 .map(|_| ())
             })
-            .await?;
-        Ok(result)
+            .await
     }
 
     /// URL to fetch audio for a matched track. Browser-friendly codecs are served
@@ -352,6 +466,36 @@ impl Plex {
 pub fn plex_bitrate(budget_kbps: Option<u32>) -> u32 {
     let budget = budget_kbps.unwrap_or(320);
     [320, 256, 192, 128, 96, 64].into_iter().find(|&r| r <= budget).unwrap_or(64)
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn plex_ids() {
+        assert_eq!(rating_key("plex_12345"), Some("12345"));
+        assert!(is_plex_id("plex_1"));
+        assert!(!is_plex_id("plex_"));
+        assert!(!is_plex_id("plex_12a"));
+        assert!(!is_plex_id("dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn parses_metadata() {
+        let m = serde_json::json!({
+            "ratingKey": "42", "title": "Song", "grandparentTitle": "Band", "parentTitle": "Album",
+            "duration": 201500, "thumb": "/library/metadata/40/thumb/1700000000",
+            "Media": [{ "audioCodec": "flac", "Part": [{ "key": "/library/parts/9/file.flac" }] }]
+        });
+        let h = PlexHit::parse(&m).unwrap();
+        assert_eq!(h.track.artist, "Band");
+        let t = h.to_track();
+        assert_eq!(t.video_id, "plex_42");
+        assert_eq!(t.duration, Some(201));
+        assert_eq!(t.album.as_deref(), Some("Album"));
+        assert_eq!(t.thumbnail.as_deref(), Some("/api/plex/art?path=%2Flibrary%2Fmetadata%2F40%2Fthumb%2F1700000000"));
+    }
 }
 
 #[cfg(test)]

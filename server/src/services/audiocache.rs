@@ -240,6 +240,12 @@ impl AudioCache {
         self.enabled() && self.age(video_id).is_some_and(|a| self.ttl().is_none_or(|ttl| a < ttl))
     }
 
+    /// Songs with a copy that new plays would use (for searching while YouTube is unavailable).
+    pub fn fresh_ids(&self) -> Vec<String> {
+        let ids: Vec<String> = self.files.lock().unwrap_or_else(|p| p.into_inner()).keys().cloned().collect();
+        ids.into_iter().filter(|id| self.fresh(id)).collect()
+    }
+
     /// Whether `/source` should report the cache: a fresh copy, and the client's quality allows it.
     pub fn peek(&self, video_id: &str, allowed: bool) -> bool {
         allowed && self.fresh(video_id)

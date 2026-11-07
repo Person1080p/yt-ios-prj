@@ -156,7 +156,7 @@ async fn process_items(
 /// Make sure a track row exists for an item that already carries a YouTube id.
 /// Uses the export's own metadata when complete, otherwise asks YouTube.
 async fn ensure_track(state: &SharedState, video_id: &str, it: &ImportItem) {
-    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) {
+    if matches!(state.db.get_track(video_id).await, Ok(Some(_))) || crate::services::plex::is_plex_id(video_id) {
         return;
     }
     let track = if !it.title.is_empty() && !it.artist.is_empty() {

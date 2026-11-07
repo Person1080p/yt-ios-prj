@@ -62,6 +62,15 @@ CREATE TABLE IF NOT EXISTS playlist_items (
 );
 CREATE INDEX IF NOT EXISTS playlist_items_pl ON playlist_items(playlist_id, pos);
 
+-- YouTube Music playlists and albums linked from the Playlists page (opened live, not copied).
+CREATE TABLE IF NOT EXISTS linked_playlists (
+    id         TEXT PRIMARY KEY,
+    title      TEXT NOT NULL,
+    subtitle   TEXT,
+    thumbnail  TEXT,
+    added_at   INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS liked (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     provider    TEXT NOT NULL,

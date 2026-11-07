@@ -6,9 +6,25 @@ use futures::{stream, StreamExt};
 
 use crate::{
     models::{HomeItem, Shelf, Track},
-    services::{matching, resolver},
+    services::{matching, plex, resolver},
     state::AppState,
 };
+
+/// The YouTube video to seed radio with. A Plex-only song has none of its own, so the closest
+/// YouTube Music search result stands in for it (None when there isn't a convincing one).
+pub async fn youtube_seed(state: &AppState, seed: &Track) -> Option<String> {
+    if !plex::is_plex_id(&seed.video_id) {
+        return Some(seed.video_id.clone());
+    }
+    let query = format!("{} {}", matching::primary_artist(&seed.artist), seed.title);
+    let results = state.yt.search_songs(&query, 5).await.ok()?;
+    results
+        .into_iter()
+        .map(|t| (matching::score(&seed.title, &seed.artist, seed.duration, &t.title, &t.artist, t.duration), t))
+        .filter(|(s, _)| *s >= 0.6)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, t)| t.video_id)
+}
 
 /// Last.fm suggestions resolved to YouTube tracks.
 async fn resolve_many(state: &AppState, pairs: Vec<(String, String)>) -> Vec<Track> {
@@ -37,10 +53,13 @@ pub async fn lastfm_similar(state: &AppState, seed: &Track, n: usize) -> Vec<Tra
 
 /// Up to `limit` tracks to follow `seed`, excluding `exclude` video ids.
 pub async fn for_track(state: &AppState, seed: &Track, limit: usize, exclude: &HashSet<String>) -> anyhow::Result<Vec<Track>> {
-    let (yt, lf) = tokio::join!(
-        state.yt.watch_playlist(Some(&seed.video_id), None, limit + 10),
-        lastfm_similar(state, seed, limit / 3 + 2),
-    );
+    let radio = async {
+        match youtube_seed(state, seed).await {
+            Some(id) => state.yt.watch_playlist(Some(&id), None, limit + 10).await,
+            None => Ok(vec![]),
+        }
+    };
+    let (yt, lf) = tokio::join!(radio, lastfm_similar(state, seed, limit / 3 + 2));
     let yt = yt.unwrap_or_else(|e| {
         tracing::warn!("youtube radio failed: {e:#}");
         vec![]

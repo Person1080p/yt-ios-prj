@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, fmtTime, type ImportJob, type LikedEntry, type Status, type Track } from "../lib/api";
+import { api, fmtTime, isPlexId, type ImportJob, type LikedEntry, type Status, type Track } from "../lib/api";
 import { enqueue, playRadio, playTracks } from "../lib/player";
 import { useStore } from "../lib/store";
 import { CloseIcon, MatchIcon, PlayIcon, QueueIcon, ShuffleIcon } from "../components/Icons";
@@ -246,36 +246,72 @@ function ImportPanel({ status, onStarted }: { status: Status | null; onStarted: 
   );
 }
 
-/** Pick which YouTube track a library entry should play. */
-function MatchSheet({ entry, onClose, onDone }: { entry: LikedEntry; onClose: () => void; onDone: () => void }) {
+type MatchSource = "youtube" | "plex";
+
+/**
+ * Pick what a library entry plays: a YouTube track, or a track from the Plex server. A song that
+ * has a YouTube match keeps it (for radio and as a fallback) and plays the chosen Plex file; one
+ * without becomes a Plex-only song.
+ */
+function MatchSheet({
+  entry,
+  plexConnected,
+  onClose,
+  onDone,
+}: {
+  entry: LikedEntry;
+  plexConnected: boolean;
+  onClose: () => void;
+  onDone: () => void;
+}) {
   const toast = useStore((s) => s.toastMsg);
-  const [q, setQ] = useState(`${entry.artist} ${entry.title}`);
+  const initial = `${entry.artist} ${entry.title}`;
+  const [source, setSource] = useState<MatchSource>("youtube");
+  const [q, setQ] = useState(initial);
   const [results, setResults] = useState<Track[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A YouTube match to keep when a Plex track is chosen.
+  const youtubeMatch = entry.track && !isPlexId(entry.track.videoId) ? entry.track : null;
 
-  const search = useCallback(async (query: string) => {
+  const search = useCallback(async (from: MatchSource, query: string) => {
     setResults(null);
     setError(null);
     try {
-      setResults(await api.search(query));
+      setResults(from === "plex" ? await api.plexSearch(query) : await api.search(query));
     } catch (e) {
       setError((e as Error).message);
     }
   }, []);
+  // Search again when the source changes, with whatever is in the box (typing searches on submit).
   useEffect(() => {
-    search(`${entry.artist} ${entry.title}`);
-  }, [entry, search]);
+    search(source, q);
+  }, [entry, source, search]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const switchTo = (s: MatchSource) => {
+    // Plex's search matches titles best; YouTube's does better with the artist too.
+    if (s === "plex" && q === initial) setQ(entry.title);
+    if (s === "youtube" && q === entry.title) setQ(initial);
+    setSource(s);
+  };
 
   const use = async (t: Track) => {
     try {
+      if (isPlexId(t.videoId) && youtubeMatch) {
+        await api.plexSetMatch(youtubeMatch.videoId, t.videoId.slice("plex_".length));
+        toast(`“${entry.title}” will play from Plex`);
+        onDone();
+        return;
+      }
       await api.library.match(entry.id, t);
-      toast(`Matched to “${t.title}”`);
+      toast(isPlexId(t.videoId) ? `Matched to “${t.title}” in Plex` : `Matched to “${t.title}”`);
       loadLibraryIds();
       onDone();
     } catch (e) {
       toast((e as Error).message);
     }
   };
+
+  const isCurrent = (t: Track) => entry.track?.videoId === t.videoId;
 
   return (
     <Sheet onClose={onClose}>
@@ -284,11 +320,27 @@ function MatchSheet({ entry, onClose, onDone }: { entry: LikedEntry; onClose: ()
         For <strong>{entry.title}</strong> by {entry.artist}
         {entry.album ? ` · ${entry.album}` : ""} ({PROVIDERS[entry.provider] ?? entry.provider})
       </p>
+      {plexConnected && (
+        <div className="tabs" role="tablist" style={{ margin: "0 8px 10px" }}>
+          {(["youtube", "plex"] as const).map((s) => (
+            <button key={s} role="tab" aria-selected={source === s} className={source === s ? "on" : ""} onClick={() => switchTo(s)}>
+              {s === "youtube" ? "YouTube" : "Plex"}
+            </button>
+          ))}
+        </div>
+      )}
+      {source === "plex" && (
+        <p className="small muted" style={{ margin: "0 8px 10px" }}>
+          {youtubeMatch
+            ? "Plays the Plex file you pick. The YouTube match stays for radio, and is used when Plex is unavailable or “Prefer Plex” is off in Settings."
+            : "Adds the song from your Plex library. It only plays while the Plex server is reachable."}
+        </p>
+      )}
       <form
         className="row gap"
         onSubmit={(e) => {
           e.preventDefault();
-          search(q);
+          search(source, q);
         }}
       >
         <input className="input" value={q} onChange={(e) => setQ(e.target.value)} />
@@ -300,8 +352,12 @@ function MatchSheet({ entry, onClose, onDone }: { entry: LikedEntry; onClose: ()
       {!results && !error && <div className="spinner" />}
       <div className="sheet-list">
         {results?.map((t) => (
-          <div key={t.videoId} className={`match-row ${entry.track?.videoId === t.videoId ? "current" : ""}`}>
-            <button className="track-main" onClick={() => playRadio(t)} title="Preview">
+          <div key={t.videoId} className={`match-row ${isCurrent(t) ? "current" : ""}`}>
+            <button
+              className="track-main"
+              onClick={() => (isPlexId(t.videoId) ? playTracks([t]) : playRadio(t))}
+              title="Preview"
+            >
               <Cover src={t.thumbnail} size={44} />
               <div className="track-text">
                 <div className="track-title">{t.title}</div>
@@ -311,7 +367,7 @@ function MatchSheet({ entry, onClose, onDone }: { entry: LikedEntry; onClose: ()
                 </div>
               </div>
             </button>
-            {entry.track?.videoId === t.videoId ? (
+            {isCurrent(t) ? (
               <span className="small muted">current</span>
             ) : (
               <button className="btn small" onClick={() => use(t)}>
@@ -320,7 +376,11 @@ function MatchSheet({ entry, onClose, onDone }: { entry: LikedEntry; onClose: ()
             )}
           </div>
         ))}
-        {results?.length === 0 && <p className="muted small">No results — try a different search.</p>}
+        {results?.length === 0 && (
+          <p className="muted small">
+            {source === "plex" ? "Nothing in Plex for that — try a shorter search (just the title)." : "No results — try a different search."}
+          </p>
+        )}
       </div>
     </Sheet>
   );
@@ -498,6 +558,7 @@ export default function Library() {
       {matching && (
         <MatchSheet
           entry={matching}
+          plexConnected={!!status?.plex.connected}
           onClose={() => setMatching(null)}
           onDone={() => {
             setMatching(null);

@@ -49,6 +49,9 @@ pub struct SearchResults {
     pub albums: Vec<HomeItem>,
     pub playlists: Vec<HomeItem>,
     pub videos: Vec<Track>,
+    /// Set when YouTube's search failed and these results come from Plex and the audio cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback: Option<String>,
 }
 
 /// A YouTube Music page reference (e.g. an artist's full discography).

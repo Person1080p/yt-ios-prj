@@ -148,3 +148,62 @@ pub async fn delete(State(st): State<SharedState>, Path(id): Path<i64>) -> ApiRe
     st.db.call(move |c| c.execute("DELETE FROM playlists WHERE id=?1", [id])).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
+
+// ---- linked YouTube Music playlists -----------------------------------------------------
+
+/// A YouTube Music playlist or album shown on the Playlists page. Its tracks are loaded from
+/// YouTube Music when opened, so it stays up to date (unlike saving a copy).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedPlaylist {
+    /// Playlist id (`PL…`, `VL…`, `RD…`) or album browse id (`MPRE…`).
+    id: String,
+    title: String,
+    #[serde(default)]
+    subtitle: Option<String>,
+    #[serde(default)]
+    thumbnail: Option<String>,
+    #[serde(default)]
+    added_at: i64,
+}
+
+pub async fn linked(State(st): State<SharedState>) -> ApiResult<Vec<LinkedPlaylist>> {
+    let rows = st
+        .db
+        .call(|c| {
+            let mut stmt = c.prepare("SELECT id, title, subtitle, thumbnail, added_at FROM linked_playlists ORDER BY added_at DESC")?;
+            let rows = stmt.query_map([], |r| {
+                Ok(LinkedPlaylist { id: r.get(0)?, title: r.get(1)?, subtitle: r.get(2)?, thumbnail: r.get(3)?, added_at: r.get(4)? })
+            })?;
+            rows.collect()
+        })
+        .await?;
+    Ok(Json(rows))
+}
+
+pub async fn link(State(st): State<SharedState>, Json(mut p): Json<LinkedPlaylist>) -> ApiResult<LinkedPlaylist> {
+    if p.id.is_empty() || p.id.len() > 128 || !p.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(AppError::bad("invalid playlist id"));
+    }
+    p.title = p.title.trim().to_string();
+    if p.title.is_empty() {
+        p.title = "Playlist".into();
+    }
+    p.added_at = now();
+    let (id, title, subtitle, thumbnail, at) = (p.id.clone(), p.title.clone(), p.subtitle.clone(), p.thumbnail.clone(), p.added_at);
+    st.db
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO linked_playlists(id, title, subtitle, thumbnail, added_at) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(id) DO UPDATE SET title=excluded.title, subtitle=excluded.subtitle, thumbnail=excluded.thumbnail",
+                params![id, title, subtitle, thumbnail, at],
+            )
+        })
+        .await?;
+    Ok(Json(p))
+}
+
+pub async fn unlink(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<serde_json::Value> {
+    st.db.call(move |c| c.execute("DELETE FROM linked_playlists WHERE id=?1", [id])).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}

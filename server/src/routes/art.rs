@@ -31,7 +31,7 @@ fn sniff(bytes: &[u8]) -> &'static str {
     }
 }
 
-fn image_response(bytes: Vec<u8>) -> Response {
+pub fn image_response(bytes: Vec<u8>) -> Response {
     let mut resp = Response::new(Body::from(bytes.clone()));
     resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(sniff(&bytes)));
     resp.headers_mut()

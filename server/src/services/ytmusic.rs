@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
@@ -399,6 +400,21 @@ impl YtMusic {
         };
         let key = self.ckey("playlist", &format!("{id}:{limit}")).await;
         cache::cached(&self.db, &key, ttl, false, || self.fetch_playlist_tracks(id, limit)).await
+    }
+
+    /// A playlist's or album's header (its name, for pages opened from a pasted link).
+    pub async fn playlist_info(&self, id: &str) -> anyhow::Result<HeaderInfo> {
+        let browse_id = if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
+            id.to_string()
+        } else {
+            format!("VL{id}")
+        };
+        let key = self.ckey("playlist-info", id).await;
+        cache::cached(&self.db, &key, 12 * cache::HOUR, false, || async move {
+            let v = self.post("browse", json!({ "browseId": browse_id }), true).await?;
+            Ok(header_info(&v))
+        })
+        .await
     }
 
     pub async fn song_info(&self, video_id: &str) -> anyhow::Result<Track> {
@@ -1281,11 +1297,12 @@ fn parse_artist(v: &Value, id: &str) -> Option<ArtistPage> {
     })
 }
 
-#[derive(Default)]
-struct HeaderInfo {
-    title: Option<String>,
-    artist: Option<String>,
-    thumbnail: Option<String>,
+/// A playlist's or album's name, owner/artist and cover, from its page header.
+#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+pub struct HeaderInfo {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub thumbnail: Option<String>,
 }
 
 fn header_info(v: &Value) -> HeaderInfo {

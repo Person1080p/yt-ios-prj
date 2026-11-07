@@ -11,7 +11,7 @@ use std::{convert::Infallible, time::Duration};
 
 use axum::{
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -44,6 +44,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/browse/grid", get(music::browse_grid))
         .route("/radio/{video_id}", get(music::radio))
         .route("/playlist/{id}", get(music::playlist))
+        .route("/playlist/{id}/info", get(music::playlist_info))
         .route("/recommendations/{video_id}", get(music::recommendations))
         .route("/tracks/{video_id}", get(music::track))
         .route("/tracks/{video_id}/source", get(stream::source))
@@ -64,6 +65,8 @@ pub fn router(state: SharedState) -> Router {
         // saved playlists
         .route("/playlists", get(playlists::list).post(playlists::create))
         .route("/playlists/{id}", get(playlists::get).put(playlists::update).delete(playlists::delete))
+        .route("/linked-playlists", get(playlists::linked).post(playlists::link))
+        .route("/linked-playlists/{id}", delete(playlists::unlink))
         // library + imports
         .route("/library/liked", get(library::liked).post(library::add))
         .route("/library/liked/{id}", delete(library::remove))
@@ -103,6 +106,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/plex/servers", get(settings::plex_servers))
         .route("/plex/server", put(settings::plex_set_server))
         .route("/plex", delete(settings::plex_disconnect))
+        .route("/plex/search", get(settings::plex_search))
+        .route("/plex/matches/{video_id}", put(settings::plex_set_match))
+        .route("/plex/art", get(settings::plex_art))
         .route("/spotify", delete(settings::spotify_disconnect))
         .route("/profile", get(profile::get).put(profile::set))
         .route("/profile/fresh/reset", post(profile::reset_fresh))
@@ -110,7 +116,10 @@ pub fn router(state: SharedState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .route("/auth/login", post(login))
         .route("/auth/check", get(auth_check))
-        .layer(middleware::from_fn(tag_origin));
+        .layer(middleware::from_fn(tag_origin))
+        // Unknown API paths would otherwise get the web app's index.html (with 200), which
+        // browsers may cache and the app can't parse — e.g. a newer page asking an older server.
+        .fallback(api_not_found);
 
     let web_dir = state.cfg.web_dir.clone();
     let spa = ServeDir::new(&web_dir).precompressed_gzip().fallback(ServeFile::new(web_dir.join("index.html")));
@@ -120,6 +129,13 @@ pub fn router(state: SharedState) -> Router {
         .fallback_service(spa)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn api_not_found() -> Response {
+    let mut resp = (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "no such API endpoint (is the server up to date?)" })))
+        .into_response();
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 /// Base URL as seen by the client, for OAuth redirect URIs.

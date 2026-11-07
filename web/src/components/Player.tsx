@@ -2,9 +2,23 @@ import { useNavigate } from "react-router-dom";
 import { useEffect, useRef, useState } from "react";
 import { api, fmtTime, type AudioSource, type Track } from "../lib/api";
 import { setLiked, useLibrary } from "../lib/library";
-import { next, playRadio, previous, seek, toggle } from "../lib/player";
+import { next, playRadio, previous, seek, setVolume, toggle, volumeAdjustable } from "../lib/player";
 import { currentTrack, useStore } from "../lib/store";
-import { ChevronDown, HeartFilledIcon, HeartIcon, MoreIcon, NextIcon, PauseIcon, PlayIcon, PrevIcon, QueueIcon, RadioIcon } from "./Icons";
+import {
+  ChevronDown,
+  HeartFilledIcon,
+  HeartIcon,
+  MoreIcon,
+  NextIcon,
+  PauseIcon,
+  PlayIcon,
+  PrevIcon,
+  QueueIcon,
+  RadioIcon,
+  VolumeIcon,
+  VolumeLowIcon,
+  VolumeMuteIcon,
+} from "./Icons";
 import { artUrl, Cover } from "./TrackRow";
 import { artistLink } from "./Shelf";
 
@@ -80,15 +94,38 @@ function BufferedRanges({ duration }: { duration: number }) {
   );
 }
 
+/** Devices with a mouse or trackpad (hover works). */
+const POINTER_QUERY = "(hover: hover) and (pointer: fine)";
+
+function useMedia(query: string) {
+  const [matches, setMatches] = useState(() => typeof matchMedia === "function" && matchMedia(query).matches);
+  useEffect(() => {
+    const m = matchMedia(query);
+    const onChange = () => setMatches(m.matches);
+    onChange();
+    m.addEventListener("change", onChange);
+    return () => m.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
+}
+
+/**
+ * Seek bar. `big`: the Now Playing one, with times. Otherwise the player bar's progress line,
+ * which is a seek bar too where there's a mouse (on touch screens, tapping the bar opens Now
+ * Playing). With a mouse, hovering shows the time under the pointer.
+ */
 function Seekbar({ big = false }: { big?: boolean }) {
   const position = useStore((s) => s.position);
   const duration = useStore((s) => s.duration);
   // While dragging, show where you are without seeking on every move (seek on release).
   const [drag, setDrag] = useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const mouse = useMedia(POINTER_QUERY);
   const shown = drag ?? position;
-  const pct = duration ? Math.min(100, (shown / duration) * 100) : 0;
-  if (!big) {
+  const pctOf = (t: number) => (duration ? Math.min(100, (t / duration) * 100) : 0);
+  const pct = pctOf(shown);
+  if (!big && !mouse) {
     return (
       <div className="mini-progress">
         <BufferedRanges duration={duration} />
@@ -100,50 +137,108 @@ function Seekbar({ big = false }: { big?: boolean }) {
     const r = ref.current!.getBoundingClientRect();
     return Math.max(0, Math.min(1, (clientX - r.left) / r.width)) * duration;
   };
+  const tip = drag ?? hover;
+  const hit = (
+    <div
+      ref={ref}
+      className={`seek-hit ${big ? "" : "bar"} ${drag != null ? "dragging" : ""}`}
+      role="slider"
+      tabIndex={0}
+      aria-label="Seek"
+      aria-valuemin={0}
+      aria-valuemax={Math.round(duration)}
+      aria-valuenow={Math.round(shown)}
+      aria-valuetext={`${fmtTime(shown)} of ${fmtTime(duration)}`}
+      onPointerDown={(e) => {
+        if (!duration || e.button !== 0) return;
+        e.preventDefault(); // no text selection, no focus jump
+        e.currentTarget.setPointerCapture(e.pointerId);
+        setDrag(timeAt(e.clientX));
+      }}
+      onPointerMove={(e) => {
+        if (drag != null) setDrag(timeAt(e.clientX));
+        else if (e.pointerType === "mouse" && duration) setHover(timeAt(e.clientX));
+      }}
+      onPointerLeave={() => setHover(null)}
+      onPointerUp={(e) => {
+        if (drag == null) return;
+        seek(timeAt(e.clientX));
+        setDrag(null);
+      }}
+      onPointerCancel={() => setDrag(null)}
+      onKeyDown={(e) => {
+        const step = { ArrowLeft: -5, ArrowRight: 5, ArrowDown: -10, ArrowUp: 10 }[e.key];
+        if (step) seek(position + step);
+        else if (e.key === "Home") seek(0);
+        else if (e.key === "End") seek(duration);
+        else return;
+        e.preventDefault();
+      }}
+    >
+      <div className="seek-track">
+        <BufferedRanges duration={duration} />
+        {hover != null && drag == null && <div className="seek-hover" style={{ width: `${pctOf(hover)}%` }} />}
+        <div className="seek-fill" style={{ width: `${pct}%` }} />
+        <div className="seek-thumb" style={{ left: `${pct}%` }} />
+      </div>
+      {tip != null && (
+        <div className="seek-tip" style={{ left: `clamp(20px, ${pctOf(tip)}%, calc(100% - 20px))` }}>
+          {fmtTime(tip)}
+        </div>
+      )}
+    </div>
+  );
+  if (!big) return <div className="bar-seek">{hit}</div>;
   return (
     <div className="seek">
-      <div
-        ref={ref}
-        className={`seek-hit ${drag != null ? "dragging" : ""}`}
-        role="slider"
-        tabIndex={0}
-        aria-label="Seek"
-        aria-valuemin={0}
-        aria-valuemax={Math.round(duration)}
-        aria-valuenow={Math.round(shown)}
-        aria-valuetext={`${fmtTime(shown)} of ${fmtTime(duration)}`}
-        onPointerDown={(e) => {
-          if (!duration || e.button !== 0) return;
-          e.preventDefault(); // no text selection, no focus jump
-          e.currentTarget.setPointerCapture(e.pointerId);
-          setDrag(timeAt(e.clientX));
-        }}
-        onPointerMove={(e) => drag != null && setDrag(timeAt(e.clientX))}
-        onPointerUp={(e) => {
-          if (drag == null) return;
-          seek(timeAt(e.clientX));
-          setDrag(null);
-        }}
-        onPointerCancel={() => setDrag(null)}
-        onKeyDown={(e) => {
-          const step = { ArrowLeft: -5, ArrowRight: 5, ArrowDown: -10, ArrowUp: 10 }[e.key];
-          if (step) seek(position + step);
-          else if (e.key === "Home") seek(0);
-          else if (e.key === "End") seek(duration);
-          else return;
-          e.preventDefault();
-        }}
-      >
-        <div className="seek-track">
-          <BufferedRanges duration={duration} />
-          <div className="seek-fill" style={{ width: `${pct}%` }} />
-          <div className="seek-thumb" style={{ left: `${pct}%` }} />
-        </div>
-      </div>
+      {hit}
       <div className="seek-times">
         <span>{fmtTime(shown)}</span>
         <span>{fmtTime(duration)}</span>
       </div>
+    </div>
+  );
+}
+
+/** Volume slider with a mute button. Not shown on phones and tablets, which always play at full volume. */
+function VolumeControl({ className = "" }: { className?: string }) {
+  const volume = useStore((s) => s.volume);
+  // Level to go back to when unmuting.
+  const before = useRef(1);
+  if (!volumeAdjustable) return null;
+  const Icon = volume === 0 ? VolumeMuteIcon : volume < 0.5 ? VolumeLowIcon : VolumeIcon;
+  const pct = Math.round(volume * 100);
+  return (
+    <div className={`volume ${className}`}>
+      <button
+        className="icon-btn"
+        aria-label={volume === 0 ? "Unmute" : "Mute"}
+        title={volume === 0 ? "Unmute" : "Mute"}
+        onClick={() => {
+          if (volume > 0) {
+            before.current = volume;
+            setVolume(0);
+          } else {
+            setVolume(before.current || 1);
+          }
+        }}
+      >
+        <Icon size={20} />
+      </button>
+      <input
+        type="range"
+        className="volume-range"
+        min={0}
+        max={1}
+        step={0.01}
+        value={volume}
+        aria-label="Volume"
+        aria-valuetext={`${pct}%`}
+        title={`Volume ${pct}%`}
+        style={{ "--vol": `${pct}%` } as React.CSSProperties}
+        onChange={(e) => setVolume(Number(e.target.value))}
+        onWheel={(e) => setVolume(volume - Math.sign(e.deltaY) * 0.05)}
+      />
     </div>
   );
 }
@@ -180,6 +275,9 @@ export function PlayerBar() {
           <button className="icon-btn" onClick={() => next()} aria-label="Next">
             <NextIcon />
           </button>
+          <span className="hide-mobile">
+            <VolumeControl />
+          </span>
         </div>
       </div>
     </div>
@@ -254,6 +352,7 @@ export function NowPlaying() {
           <QueueIcon />
         </button>
       </div>
+      <VolumeControl className="np-volume" />
       <button className="btn ghost np-radio" onClick={() => playRadio(track)}>
         <RadioIcon size={18} /> Start radio from this song
       </button>

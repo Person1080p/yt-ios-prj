@@ -1,6 +1,7 @@
 import { Link, useNavigate } from "react-router-dom";
 import type { HomeItem, Shelf } from "../lib/api";
 import { playRadio, playTracks } from "../lib/player";
+import { usePressMenu } from "../lib/pressMenu";
 import { useStore } from "../lib/store";
 import { PlayIcon } from "./Icons";
 import { Cover } from "./TrackRow";
@@ -25,6 +26,8 @@ export function Card({ item, size = 148, onPlay }: { item: HomeItem; size?: numb
   const nav = useNavigate();
   const openMenu = useStore((s) => s.openMenu);
   const link = itemLink(item);
+  const track = item.track;
+  const press = usePressMenu(track ? () => openMenu(track) : null);
   return (
     <div className="card" style={{ width: size }}>
       <button
@@ -33,12 +36,7 @@ export function Card({ item, size = 148, onPlay }: { item: HomeItem; size?: numb
           if (item.track) (onPlay ?? (() => playRadio(item.track!)))();
           else if (link) nav(link);
         }}
-        onContextMenu={(e) => {
-          if (item.track) {
-            e.preventDefault();
-            openMenu(item.track);
-          }
-        }}
+        {...press}
       >
         <Cover src={item.thumbnail} size={size} round={item.kind === "artist"} />
         <div className={`card-title ${item.kind === "artist" ? "center" : ""}`}>{item.title}</div>
