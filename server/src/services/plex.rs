@@ -13,7 +13,51 @@ use crate::{
 
 const PRODUCT: &str = "ytp";
 const NEGATIVE_TTL: i64 = 60 * 60 * 24 * 3;
-const MATCH_THRESHOLD: f32 = 0.82;
+pub const MATCH_THRESHOLD: f32 = 0.82;
+/// Bumped when automatic matching improves: older automatic matches are redone on next play.
+/// (2: wider search, same album and closer length preferred, live recordings avoided.)
+const MATCHER_VERSION: i64 = 2;
+/// How many search results automatic matching looks through: a song with many live copies can
+/// push the studio one well down the list.
+const MATCH_SEARCH_LIMIT: usize = 50;
+
+/// What a YouTube song plays from Plex, as stored.
+#[derive(Debug, Clone)]
+struct StoredMatch {
+    track: Option<PlexTrack>,
+    checked_at: i64,
+    /// Chosen by you (a track, or "don't use Plex") rather than by automatic matching.
+    manual: bool,
+    version: i64,
+}
+
+/// How a song's Plex copy is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchMode {
+    /// Automatic matching.
+    Auto,
+    /// A track you picked.
+    Picked,
+    /// Never from Plex.
+    Off,
+}
+
+/// How well a Plex track matches `want`: (score, checked against the match threshold; rank,
+/// which also prefers the same album and the studio recording, for choosing among copies).
+pub fn rank(want: &Track, h: &PlexHit) -> (f32, f32) {
+    let pt = &h.track;
+    let s = |artist: &str| matching::score_unclamped(&want.title, &want.artist, want.duration, &pt.title, artist, h.duration);
+    let base = s(&pt.artist).max(s(&h.album_artist));
+    let mut r = base;
+    if let (Some(a), Some(b)) = (want.album.as_deref(), h.album.as_deref()) {
+        r += 0.15 * matching::similarity(&matching::normalize(a), &matching::normalize(b));
+    }
+    if matching::looks_live(&pt.title, h.album.as_deref()) && !matching::looks_live(&want.title, want.album.as_deref()) {
+        r -= 0.2;
+    }
+    (base.clamp(0.0, 1.0), r)
+}
 
 #[derive(Clone)]
 pub struct Plex {
@@ -256,11 +300,17 @@ impl Plex {
     // ---- matching ---------------------------------------------------------
 
     pub async fn search(&self, query: &str) -> anyhow::Result<Vec<PlexHit>> {
+        self.search_n(query, 15).await
+    }
+
+    /// Track results of a Plex search (up to `limit` per library).
+    pub async fn search_n(&self, query: &str, limit: usize) -> anyhow::Result<Vec<PlexHit>> {
         let Some((url, token)) = self.server().await else { bail!("plex not configured") };
+        let limit = limit.to_string();
         let v: Value = self
             .http
             .get(format!("{url}/hubs/search"))
-            .query(&[("query", query), ("limit", "15"), ("includeCollections", "0")])
+            .query(&[("query", query), ("limit", limit.as_str()), ("includeCollections", "0")])
             .header("accept", "application/json")
             .header("X-Plex-Token", token)
             .timeout(std::time::Duration::from_secs(8))
@@ -300,12 +350,12 @@ impl Plex {
     /// The Plex track behind a Plex-only id (`plex_<ratingKey>`), cached like matches.
     pub async fn track_for_id(&self, video_id: &str) -> anyhow::Result<Option<PlexTrack>> {
         let Some(rk) = rating_key(video_id) else { return Ok(None) };
-        if let Some((true, Some(t), _)) = self.cached(video_id).await? {
+        if let Some(StoredMatch { track: Some(t), .. }) = self.cached(video_id).await? {
             return Ok(Some(t));
         }
         let found = self.track_by_key(rk).await?.map(|h| h.track);
         if found.is_some() {
-            self.store(video_id, found.as_ref()).await?;
+            self.store(video_id, found.as_ref(), true).await?;
         }
         Ok(found)
     }
@@ -313,8 +363,47 @@ impl Plex {
     /// Play `video_id` (a YouTube track) from this Plex track, whatever automatic matching thinks.
     pub async fn pin(&self, video_id: &str, rating_key: &str) -> anyhow::Result<PlexTrack> {
         let Some(hit) = self.track_by_key(rating_key).await? else { bail!("that track is no longer on the Plex server") };
-        self.store(video_id, Some(&hit.track)).await?;
+        self.store(video_id, Some(&hit.track), true).await?;
         Ok(hit.track)
+    }
+
+    /// Never play `video_id` from Plex (until you pick a track or go back to automatic).
+    pub async fn block(&self, video_id: &str) -> anyhow::Result<()> {
+        self.store(video_id, None, true).await
+    }
+
+    /// Back to automatic matching for `video_id`: it's matched afresh on next play.
+    pub async fn forget(&self, video_id: &str) -> anyhow::Result<()> {
+        let vid = video_id.to_string();
+        self.db.call(move |c| c.execute("DELETE FROM plex_matches WHERE video_id=?1", [vid]).map(|_| ())).await
+    }
+
+    /// How `video_id`'s Plex copy is chosen now, and the stored track if any.
+    pub async fn choice(&self, video_id: &str) -> anyhow::Result<(MatchMode, Option<PlexTrack>)> {
+        Ok(match self.cached(video_id).await? {
+            Some(m) if m.manual => (if m.track.is_some() { MatchMode::Picked } else { MatchMode::Off }, m.track),
+            // An automatic match from an older matcher is redone on next play.
+            Some(m) => (MatchMode::Auto, m.track.filter(|_| m.version >= MATCHER_VERSION)),
+            None => (MatchMode::Auto, None),
+        })
+    }
+
+    /// Plex tracks that could be `track`, best first, with their match score.
+    pub async fn candidates(&self, track: &Track) -> anyhow::Result<Vec<(PlexHit, f32)>> {
+        let title_q = matching::normalize(&track.title);
+        let mut hits = self.search_n(&title_q, MATCH_SEARCH_LIMIT).await?;
+        if hits.is_empty() {
+            hits = self.search_n(&format!("{} {}", matching::primary_artist(&track.artist), title_q), MATCH_SEARCH_LIMIT).await?;
+        }
+        let mut ranked: Vec<(PlexHit, f32, f32)> = hits
+            .into_iter()
+            .map(|h| {
+                let (score, r) = rank(track, &h);
+                (h, score, r)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2));
+        Ok(ranked.into_iter().map(|(h, s, _)| (h, s)).collect())
     }
 
     /// Artwork from the Plex server, resized. `path` is a Plex thumb path from [`PlexHit`].
@@ -337,85 +426,70 @@ impl Plex {
         Ok(bytes.to_vec())
     }
 
-    /// (matched, track, checked_at) from the match cache.
-    async fn cached(&self, video_id: &str) -> anyhow::Result<Option<(bool, Option<PlexTrack>, i64)>> {
+    /// The stored match for `video_id`, if any.
+    async fn cached(&self, video_id: &str) -> anyhow::Result<Option<StoredMatch>> {
         let vid = video_id.to_string();
-        let row = self
-            .db
+        self.db
             .call(move |c| {
                 c.query_row(
-                    "SELECT matched, rating_key, part_key, codec, title, artist, checked_at FROM plex_matches WHERE video_id=?1",
+                    "SELECT matched, rating_key, part_key, codec, title, artist, checked_at, manual, version
+                     FROM plex_matches WHERE video_id=?1",
                     [vid],
                     |r| {
-                        Ok((
-                            r.get::<_, bool>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                            r.get::<_, Option<String>>(5)?,
-                            r.get::<_, i64>(6)?,
-                        ))
+                        let matched: bool = r.get(0)?;
+                        let track = if matched {
+                            Some(PlexTrack {
+                                rating_key: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                                part_key: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                                codec: r.get(3)?,
+                                title: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                                artist: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(StoredMatch { track, checked_at: r.get(6)?, manual: r.get(7)?, version: r.get(8)? })
                     },
                 )
                 .optional()
             })
-            .await?;
-        Ok(row.map(|(matched, rk, pk, codec, title, artist, checked)| {
-            let track = matched.then(|| PlexTrack {
-                rating_key: rk.unwrap_or_default(),
-                part_key: pk.unwrap_or_default(),
-                codec,
-                title: title.unwrap_or_default(),
-                artist: artist.unwrap_or_default(),
-            });
-            (matched, track, checked)
-        }))
+            .await
     }
 
-    /// Find the Plex copy of a YouTube track, with a persistent cache.
+    /// Find the Plex copy of a YouTube track, with a persistent cache. A track you picked (or
+    /// "don't use Plex") always wins.
     pub async fn find_match(&self, track: &Track) -> anyhow::Result<Option<PlexTrack>> {
         if is_plex_id(&track.video_id) {
             return self.track_for_id(&track.video_id).await;
         }
-        if let Some((matched, t, checked)) = self.cached(&track.video_id).await? {
-            if matched {
-                return Ok(t);
+        if let Some(m) = self.cached(&track.video_id).await? {
+            if m.manual || (m.track.is_some() && m.version >= MATCHER_VERSION) {
+                return Ok(m.track);
             }
-            if now() - checked < NEGATIVE_TTL {
+            if m.track.is_none() && now() - m.checked_at < NEGATIVE_TTL {
                 return Ok(None);
             }
         }
 
-        let title_q = matching::normalize(&track.title);
-        let mut candidates = self.search(&title_q).await?;
-        if candidates.is_empty() {
-            candidates = self.search(&format!("{} {}", matching::primary_artist(&track.artist), title_q)).await?;
-        }
-        let best = candidates
+        let result = self
+            .candidates(track)
+            .await?
             .into_iter()
-            .map(|h| {
-                let pt = h.track;
-                let s1 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &pt.artist, h.duration);
-                let s2 = matching::score(&track.title, &track.artist, track.duration, &pt.title, &h.album_artist, h.duration);
-                (s1.max(s2), pt)
-            })
-            .max_by(|a, b| a.0.total_cmp(&b.0));
-
-        let result = best.filter(|(s, _)| *s >= MATCH_THRESHOLD).map(|(_, t)| t);
-        self.store(&track.video_id, result.as_ref()).await?;
+            .find(|(_, score)| *score >= MATCH_THRESHOLD)
+            .map(|(h, _)| h.track);
+        self.store(&track.video_id, result.as_ref(), false).await?;
         Ok(result)
     }
 
     /// Save a match (or that there is none) for `video_id`.
-    async fn store(&self, video_id: &str, track: Option<&PlexTrack>) -> anyhow::Result<()> {
+    async fn store(&self, video_id: &str, track: Option<&PlexTrack>, manual: bool) -> anyhow::Result<()> {
         let vid = video_id.to_string();
         let r = track.cloned();
         self.db
             .call(move |c| {
                 c.execute(
-                    "INSERT OR REPLACE INTO plex_matches(video_id,matched,rating_key,part_key,codec,title,artist,checked_at)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                    "INSERT OR REPLACE INTO plex_matches(video_id,matched,rating_key,part_key,codec,title,artist,checked_at,manual,version)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                     params![
                         vid,
                         r.is_some(),
@@ -424,7 +498,9 @@ impl Plex {
                         r.as_ref().and_then(|t| t.codec.clone()),
                         r.as_ref().map(|t| &t.title),
                         r.as_ref().map(|t| &t.artist),
-                        now()
+                        now(),
+                        manual,
+                        MATCHER_VERSION
                     ],
                 )
                 .map(|_| ())

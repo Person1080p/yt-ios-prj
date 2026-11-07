@@ -17,7 +17,7 @@ use crate::{
         audiocache,
         importers,
         playback::{self, PlaybackEvent},
-        plex::{self, PlexPin, PlexServer, PlexTrack},
+        plex::{self, MatchMode, PlexPin, PlexServer, PlexTrack},
         tailscale::{self, TailscaleInfo},
         ytauth, ytlog,
         ytmusic::{pace_base_ms, ACCOUNT_KEY, DEFAULT_IMPORT_PACE, IMPORT_PACE_KEY, COOKIE_SOURCE_KEY, COOKIE_SYNCED_KEY},
@@ -349,6 +349,78 @@ pub async fn plex_set_match(
     }
     let t = st.plex.pin(&video_id, &b.rating_key).await.map_err(|e| AppError::bad(format!("{e:#}")))?;
     Ok(Json(t))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexCandidate {
+    /// The Plex track, under its Plex-only id.
+    track: Track,
+    score: f32,
+    live: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlexChoice {
+    mode: plex::MatchMode,
+    /// The rating key it plays from now (in automatic mode, also one not yet stored).
+    current: Option<String>,
+    /// Possible Plex copies, best first.
+    candidates: Vec<PlexCandidate>,
+}
+
+/// Which Plex track a song plays from, and the alternatives to choose from.
+pub async fn plex_get_match(State(st): State<SharedState>, Path(video_id): Path<String>) -> ApiResult<PlexChoice> {
+    if st.plex.server().await.is_none() {
+        return Err(AppError::NotConfigured("Connect Plex in Settings first".into()));
+    }
+    if plex::is_plex_id(&video_id) {
+        return Err(AppError::bad("that song is a Plex track"));
+    }
+    let track = crate::routes::music::track_or_fetch(&st, &video_id).await?;
+    let (mode, stored) = st.plex.choice(&video_id).await?;
+    let found = st.plex.candidates(&track).await.map_err(|e| AppError::bad(format!("Plex search failed: {e:#}")))?;
+    let current = match (mode, stored) {
+        (MatchMode::Off, _) => None,
+        (_, Some(t)) => Some(t.rating_key),
+        // Not matched yet (or due a redo): what automatic matching would pick.
+        (_, None) => found.iter().find(|(_, s)| *s >= plex::MATCH_THRESHOLD).map(|(h, _)| h.track.rating_key.clone()),
+    };
+    let candidates = found
+        .into_iter()
+        .filter(|(_, s)| *s >= 0.5)
+        .take(30)
+        .map(|(h, score)| PlexCandidate {
+            live: crate::services::matching::looks_live(&h.track.title, h.album.as_deref()),
+            track: h.to_track(),
+            score,
+        })
+        .collect();
+    Ok(Json(PlexChoice { mode, current, candidates }))
+}
+
+#[derive(Deserialize)]
+pub struct PlexClearQuery {
+    /// `off`: never play this song from Plex; `auto` (default): back to automatic matching.
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+pub async fn plex_clear_match(
+    State(st): State<SharedState>,
+    Path(video_id): Path<String>,
+    Query(q): Query<PlexClearQuery>,
+) -> ApiResult<Value> {
+    if plex::is_plex_id(&video_id) {
+        return Err(AppError::bad("that song is a Plex track"));
+    }
+    match q.mode.as_deref() {
+        Some("off") => st.plex.block(&video_id).await?,
+        None | Some("auto") => st.plex.forget(&video_id).await?,
+        Some(m) => return Err(AppError::bad(format!("unknown mode {m}"))),
+    }
+    Ok(ok())
 }
 
 #[derive(Deserialize)]

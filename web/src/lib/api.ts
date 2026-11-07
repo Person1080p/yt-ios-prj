@@ -57,6 +57,15 @@ export type ImportJob = {
 /** Where a track's audio comes from: the Plex library, a recent MP3 copy kept by the server, or YouTube. */
 export type AudioSource = "plex" | "cache" | "youtube";
 
+/** How a song's Plex copy is chosen: automatically, picked by you, or never from Plex. */
+export type PlexChoice = {
+  mode: "auto" | "picked" | "off";
+  /** Rating key of the Plex track it plays from now. */
+  current?: string | null;
+  /** Possible Plex copies, best match first (tracks under Plex-only ids). */
+  candidates: { track: Track; score: number; live: boolean }[];
+};
+
 export type HistoryEntry = { playedAt: number; source: string; scrobbled: boolean; track: Track };
 
 export type ProfileInfo = { active: "main" | "fresh"; freshPlays: number; freshStartedAt?: number | null };
@@ -217,9 +226,18 @@ export type ArtistPage = {
   shelves: ArtistShelf[];
 };
 export type GridPage = { title: string; items: HomeItem[] };
+/** A page of the home feed; `continuation` fetches the next one (absent at the end). */
+export type HomeFeed = { shelves: Shelf[]; continuation?: string };
+/** A page of tracks (a podcast's episodes); `continuation` fetches the next one (null at the end). */
+export type TrackPage = { tracks: Track[]; continuation?: string | null };
 
 export const api = {
-  home: (refresh = false) => req<{ shelves: Shelf[] }>(`/home${refresh ? "?refresh=1" : ""}`),
+  home: (refresh = false) => req<HomeFeed>(`/home${refresh ? "?refresh=1" : ""}`),
+  /** The next shelves of the home feed, from the previous page's `continuation`. */
+  homeMore: (token: string) => req<HomeFeed>(`/home/more?token=${enc(token)}`),
+  /** A podcast's newest episodes; `continuation` fetches the next page (one YouTube call each). */
+  podcast: (id: string) => req<TrackPage>(`/podcast/${enc(id)}`),
+  podcastMore: (id: string, token: string) => req<TrackPage>(`/podcast/${enc(id)}/more?token=${enc(token)}`),
   discover: () => req<{ shelves: Shelf[] }>("/discover"),
   search: (q: string, signal?: AbortSignal) => req<Track[]>(`/search?q=${enc(q)}`, { signal }),
   searchAll: (q: string, filter?: SearchFilter, signal?: AbortSignal) =>
@@ -336,6 +354,11 @@ export const api = {
   /** Play a YouTube-matched song from this Plex track. */
   plexSetMatch: (videoId: string, ratingKey: string) =>
     req<{ ratingKey: string }>(`/plex/matches/${enc(videoId)}`, { method: "PUT", body: { ratingKey } }),
+  /** Which Plex track a YouTube song plays from, and the Plex copies to choose from. */
+  plexMatch: (videoId: string) => req<PlexChoice>(`/plex/matches/${enc(videoId)}`),
+  /** `off`: never play this song from Plex; `auto`: back to automatic matching. */
+  plexClearMatch: (videoId: string, mode: "off" | "auto") =>
+    req<{ ok: boolean }>(`/plex/matches/${enc(videoId)}?mode=${mode}`, { method: "DELETE" }),
   spotifyDisconnect: () => req<{ ok: boolean }>("/spotify", { method: "DELETE" }),
   authCheck: () => req<{ authenticated: boolean; required: boolean }>("/auth/check"),
   login: (token: string) => req<{ ok: boolean }>("/auth/login", { body: { token } }),
@@ -348,7 +371,33 @@ function withArgs(path: string, args: string[]) {
 
 /** `/stream/:id` with the current quality budget (see quality.ts). */
 function streamPath(videoId: string, via?: "youtube" | "pipe") {
-  return withArgs(`/stream/${enc(videoId)}`, [...(via ? [`via=${via}`] : []), ...qualityArgs()]);
+  const rev = sourceRevs[videoId];
+  return withArgs(`/stream/${enc(videoId)}`, [...(via ? [`via=${via}`] : []), ...qualityArgs(), ...(rev ? [`rev=${rev}`] : [])]);
+}
+
+// Songs whose audio source just changed (a Plex version picked or turned off). Their stream URLs
+// get a `rev`, since the browser may keep a Plex stream for an hour under the old URL. Kept a
+// couple of hours (longer than that cache) and across reloads.
+const REV_KEY = "ytp.sourceRev";
+const REV_KEEP_MS = 2 * 3600_000;
+let sourceRevs: Record<string, number> = (() => {
+  try {
+    return JSON.parse(localStorage.getItem(REV_KEY) ?? "{}") as Record<string, number>;
+  } catch {
+    return {};
+  }
+})();
+
+/** `videoId` now plays from a different source: don't reuse a stream the browser kept. */
+export function bumpSourceRev(videoId: string) {
+  const now = Date.now();
+  sourceRevs = Object.fromEntries(Object.entries(sourceRevs).filter(([, t]) => now - t < REV_KEEP_MS));
+  sourceRevs[videoId] = now;
+  try {
+    localStorage.setItem(REV_KEY, JSON.stringify(sourceRevs));
+  } catch {
+    // private mode: this session still gets fresh URLs
+  }
 }
 
 export function fetchAudio(videoId: string, via?: "youtube" | "pipe", signal?: AbortSignal) {

@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::{ApiResult, AppError},
     models::{ArtistPage, GridPage, SearchResults, Shelf, Track},
-    services::{matching, plex, recommend, ytmusic::HeaderInfo},
+    services::{
+        matching, plex, recommend,
+        ytmusic::{HeaderInfo, HomePage, TrackPage},
+    },
     state::SharedState,
 };
 
@@ -17,6 +20,9 @@ use crate::{
 #[serde(rename_all = "camelCase")]
 pub struct HomeResponse {
     pub shelves: Vec<Shelf>,
+    /// Pass to `/home/more` for the next shelves; absent at the end of the feed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -26,14 +32,30 @@ pub struct RefreshQuery {
 }
 
 pub async fn home(State(st): State<SharedState>, Query(q): Query<RefreshQuery>) -> ApiResult<HomeResponse> {
-    let shelves = st.yt.home(q.refresh.is_some()).await?;
-    let tracks: Vec<Track> = shelves.iter().flat_map(|s| s.items.iter().filter_map(|i| i.track.clone())).collect();
+    home_response(&st, st.yt.home(q.refresh.is_some()).await?).await
+}
+
+#[derive(Deserialize)]
+pub struct MoreQuery {
+    token: String,
+}
+
+/// The next shelves of the home feed (infinite scroll).
+pub async fn home_more(State(st): State<SharedState>, Query(q): Query<MoreQuery>) -> ApiResult<HomeResponse> {
+    if !q.token.contains('|') || q.token.len() > 8192 {
+        return Err(AppError::bad("invalid token"));
+    }
+    home_response(&st, st.yt.home_more(&q.token).await?).await
+}
+
+async fn home_response(st: &SharedState, page: HomePage) -> ApiResult<HomeResponse> {
+    let tracks: Vec<Track> = page.shelves.iter().flat_map(|s| s.items.iter().filter_map(|i| i.track.clone())).collect();
     st.db.upsert_tracks(tracks).await?;
-    Ok(Json(HomeResponse { shelves }))
+    Ok(Json(HomeResponse { shelves: page.shelves, continuation: page.continuation }))
 }
 
 pub async fn discover(State(st): State<SharedState>) -> ApiResult<HomeResponse> {
-    Ok(Json(HomeResponse { shelves: recommend::discover(&st).await? }))
+    Ok(Json(HomeResponse { shelves: recommend::discover(&st).await?, continuation: None }))
 }
 
 #[derive(Deserialize)]
@@ -69,9 +91,32 @@ pub async fn radio(State(st): State<SharedState>, Path(video_id): Path<String>) 
 }
 
 pub async fn playlist(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<Vec<Track>> {
-    let tracks = st.yt.playlist_tracks(&id, 500).await?;
+    // A podcast: just its newest episodes (one YouTube call); its page loads more as you scroll.
+    let tracks = if id.starts_with("MPSP") {
+        st.yt.podcast_episodes(&id).await?.tracks
+    } else {
+        st.yt.playlist_tracks(&id, 500).await?
+    };
     st.db.upsert_tracks(tracks.clone()).await?;
     Ok(Json(tracks))
+}
+
+/// A podcast's newest episodes and the token for more: one YouTube call per page.
+pub async fn podcast(State(st): State<SharedState>, Path(id): Path<String>) -> ApiResult<TrackPage> {
+    valid_browse_id(&id)?;
+    let page = st.yt.podcast_episodes(&id).await?;
+    st.db.upsert_tracks(page.tracks.clone()).await?;
+    Ok(Json(page))
+}
+
+/// The next page of a podcast's episodes (`token` from the page before).
+pub async fn podcast_more(State(st): State<SharedState>, Query(q): Query<MoreQuery>) -> ApiResult<TrackPage> {
+    if q.token.is_empty() || q.token.len() > 8192 {
+        return Err(AppError::bad("invalid token"));
+    }
+    let page = st.yt.episodes_more(&q.token).await?;
+    st.db.upsert_tracks(page.tracks.clone()).await?;
+    Ok(Json(page))
 }
 
 /// A playlist's or album's name, owner/artist and cover.

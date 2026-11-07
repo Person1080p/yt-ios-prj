@@ -10,7 +10,7 @@ import { setToken as saveToken, useConnection, useTransportReady, watchConnectio
 import OAuthReturn from "./pages/OAuthReturn";
 import { HomeIcon, LibraryIcon, ListIcon, QueueIcon, SearchIcon, SettingsIcon } from "./components/Icons";
 import { NowPlaying, PlayerBar } from "./components/Player";
-import { PlaylistPicker, Toast, TrackMenu } from "./components/Sheets";
+import { PlaylistPicker, PlexVersionSheet, Toast, TrackMenu } from "./components/Sheets";
 import Home from "./pages/Home";
 import Search from "./pages/Search";
 import Collection from "./pages/Collection";
@@ -170,6 +170,7 @@ export default function App() {
       <NowPlaying />
       <TrackMenu />
       <PlaylistPicker />
+      <PlexVersionSheet />
       <Toast />
     </div>
   );

@@ -68,6 +68,19 @@ pub fn score(
     cand_artist: &str,
     cand_duration: Option<u32>,
 ) -> f32 {
+    score_unclamped(want_title, want_artist, want_duration, cand_title, cand_artist, cand_duration).clamp(0.0, 1.0)
+}
+
+/// [`score`] before clamping, for ranking candidates: an exact title and artist already reach 1,
+/// and the duration bonus on top is what tells the right recording from another one.
+pub fn score_unclamped(
+    want_title: &str,
+    want_artist: &str,
+    want_duration: Option<u32>,
+    cand_title: &str,
+    cand_artist: &str,
+    cand_duration: Option<u32>,
+) -> f32 {
     let wt = normalize(want_title);
     let ct = normalize(cand_title);
     let title = similarity(&wt, &ct);
@@ -91,8 +104,20 @@ pub fn score(
         } else if diff > 20 {
             s -= 0.25;
         }
+        // Closer is better, also within those bands.
+        s -= diff.min(30) as f32 * 0.002;
     }
-    s.clamp(0.0, 1.0)
+    s
+}
+
+static LIVE_WORDS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(live|concert|tour|festival|session|sessions|unplugged|bootleg|in concert|acoustic)\b|\b\d{4}[.\-/]\d{2}[.\-/]\d{2}\b|\b\d{2}[.\-/]\d{2}[.\-/]\d{4}\b").unwrap()
+});
+
+/// A live, session or acoustic recording, judging by its title or album
+/// ("A Forest (Live)", "Bestival Live 2011", "2008.12.13 West Hollywood").
+pub fn looks_live(title: &str, album: Option<&str>) -> bool {
+    LIVE_WORDS.is_match(title) || album.is_some_and(|a| LIVE_WORDS.is_match(a))
 }
 
 #[cfg(test)]
@@ -111,5 +136,22 @@ mod tests {
     fn scores() {
         assert!(score("Get Lucky", "Daft Punk", Some(248), "Get Lucky (feat. Pharrell Williams)", "Daft Punk, Pharrell Williams", Some(249)) > 0.9);
         assert!(score("Get Lucky", "Daft Punk", Some(248), "Lose Yourself", "Eminem", Some(320)) < 0.3);
+    }
+
+    #[test]
+    fn ranks_closer_duration_first() {
+        let exact = score_unclamped("A Forest", "The Cure", Some(355), "A Forest", "The Cure", Some(355));
+        let near = score_unclamped("A Forest", "The Cure", Some(355), "A Forest", "The Cure", Some(361));
+        assert!(exact > near && near > 0.95);
+    }
+
+    #[test]
+    fn spots_live_recordings() {
+        assert!(looks_live("A Forest (Live)", None));
+        assert!(looks_live("A Forest", Some("Bestival Live 2011")));
+        assert!(looks_live("A Forest", Some("2008.12.13 West Hollywood, CA")));
+        assert!(looks_live("A Forest", Some("The 1985 European Tour")));
+        assert!(!looks_live("A Forest", Some("Seventeen Seconds")));
+        assert!(!looks_live("Alive", Some("Alive & Well")));
     }
 }

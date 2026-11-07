@@ -13,7 +13,7 @@
 // `volume` and only lets an element that has already played auto-advance in the
 // background, so there a single element is kept and only the download is done ahead.
 
-import { api, fetchAudio, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
+import { api, bumpSourceRev, fetchAudio, randomId, streamUrl, type AudioSource, type InsertAt, type Queue, type QueueItem, type Track } from "./api";
 import { useStore } from "./store";
 import { apiFetch, detectConnection, isTailnet } from "./transport";
 import { loadProfile } from "./profile";
@@ -238,7 +238,7 @@ function onStall() {
 }
 
 /** Reload the current song at the current quality budget, carrying on from the same spot. */
-function reloadAtPosition() {
+function reloadAtPosition(play = true) {
   const it = current();
   if (!it || it.track.videoId !== activeVideoId) return;
   const el = audio;
@@ -249,7 +249,45 @@ function reloadAtPosition() {
   fetchSource(el, it.track.videoId, loadToken);
   quiet();
   el.addEventListener("loadedmetadata", () => audio === el && (el.currentTime = at), { once: true });
-  el.play().catch(() => {});
+  if (play) el.play().catch(() => {});
+}
+
+/**
+ * The server now plays `videoId` from a different source (a Plex version was picked, or Plex
+ * turned off for it): forget copies loaded in advance, and if it's the song playing, switch it
+ * over at the same spot, keeping it playing or paused.
+ */
+export function reloadSource(videoId: string) {
+  bumpSourceRev(videoId);
+  for (const [k, v] of blobs) {
+    if (!k.startsWith(`${videoId}|`) && !k.startsWith(`${videoId}pipe|`)) continue;
+    if (!els.some((el) => el.src === v.url)) URL.revokeObjectURL(v.url);
+    blobs.delete(k);
+  }
+  if (spare?.videoId === videoId) {
+    resetEl(spare.el);
+    spare = null;
+  }
+  const it = current();
+  if (!it || it.track.videoId !== videoId || activeVideoId !== videoId) return;
+  const play = !audio.paused;
+  if (!isTailnet()) return reloadAtPosition(play);
+  const el = audio;
+  const at = el.currentTime;
+  const old = el.src;
+  const token = loadToken;
+  loadBlob(videoId)
+    .then((l) => {
+      if (token !== loadToken || audio !== el) return;
+      el.src = l.url;
+      assign(el, videoId, l.url, l.kbps);
+      set({ source: l.source, streamKbps: l.kbps });
+      quiet();
+      el.addEventListener("loadedmetadata", () => audio === el && (el.currentTime = at), { once: true });
+      if (play) el.play().catch(() => {});
+      if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+    })
+    .catch((e) => get().toastMsg(`Couldn't switch versions: ${(e as Error).message}`));
 }
 
 const set = useStore.setState;

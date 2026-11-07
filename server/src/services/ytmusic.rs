@@ -234,7 +234,10 @@ impl YtMusic {
         self.post_with(endpoint, body, creds).await
     }
 
+    /// A `context.client.visitorData` already in `body` is kept (continuations need the visitor
+    /// id of the session that got the token).
     async fn post_with(&self, endpoint: &str, mut body: Value, creds: Creds) -> anyhow::Result<Value> {
+        let given_visitor = body["context"]["client"]["visitorData"].as_str().map(String::from);
         let mut client = json!({
             "clientName": "WEB_REMIX",
             "clientVersion": client_version(),
@@ -242,6 +245,8 @@ impl YtMusic {
             "gl": "US",
         });
         if let Creds::Visitor(Some(v)) = &creds {
+            client["visitorData"] = json!(v);
+        } else if let Some(v) = given_visitor {
             client["visitorData"] = json!(v);
         }
         body["context"] = json!({ "client": client, "user": {} });
@@ -326,6 +331,11 @@ impl YtMusic {
             Creds::Visitor(Some(v)) => req = req.header("x-goog-visitor-id", v.clone()),
             _ => {}
         }
+        if !matches!(creds, Creds::Visitor(Some(_))) {
+            if let Some(v) = body["context"]["client"]["visitorData"].as_str() {
+                req = req.header("x-goog-visitor-id", v);
+            }
+        }
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -383,10 +393,35 @@ impl YtMusic {
         cache::cached(&self.db, &key, 6 * cache::HOUR, false, || self.fetch_watch_playlist(video_id, playlist_id, limit)).await
     }
 
-    /// Home feed; `refresh` bypasses the cache (pull-to-refresh).
-    pub async fn home(&self, refresh: bool) -> anyhow::Result<Vec<Shelf>> {
-        let key = self.ckey("home", "").await;
+    /// Home feed's first page; `refresh` bypasses the cache (pull-to-refresh).
+    pub async fn home(&self, refresh: bool) -> anyhow::Result<HomePage> {
+        let key = self.ckey("home-page", "").await;
         cache::cached(&self.db, &key, 20 * cache::MINUTE, refresh, || self.fetch_home()).await
+    }
+
+    /// The next page of the home feed, as YouTube Music loads it when you scroll down
+    /// (`continuation` from the page before). Cached per token as long as the first page, so
+    /// scrolling down again costs no YouTube calls.
+    pub async fn home_more(&self, continuation: &str) -> anyhow::Result<HomePage> {
+        let digest: String = Sha1::digest(continuation.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let key = self.ckey("home-more", &digest).await;
+        cache::cached(&self.db, &key, 20 * cache::MINUTE, false, || async move {
+            let (visitor, token) = continuation.split_once('|').context("invalid continuation")?;
+            let visitor = (!visitor.is_empty()).then_some(visitor);
+            let v = self.post_continuation(token, visitor).await?;
+            Ok(HomePage { shelves: parse_shelves(&v), continuation: home_continuation(&v, visitor) })
+        })
+        .await
+    }
+
+    /// A feed continuation. YouTube ties the token to the session that got it: without the first
+    /// page's visitor id the answer is empty unless you're signed in.
+    async fn post_continuation(&self, token: &str, visitor: Option<&str>) -> anyhow::Result<Value> {
+        let mut body = json!({ "continuation": token });
+        if let Some(v) = visitor {
+            body["context"] = json!({ "client": { "visitorData": v } });
+        }
+        self.post("browse", body, true).await
     }
 
     pub async fn playlist_tracks(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
@@ -402,13 +437,36 @@ impl YtMusic {
         cache::cached(&self.db, &key, ttl, false, || self.fetch_playlist_tracks(id, limit)).await
     }
 
-    /// A playlist's or album's header (its name, for pages opened from a pasted link).
+    /// A podcast's newest episodes: one YouTube call, plus the token for the next page (see
+    /// [`Self::episodes_more`]), loaded only as you scroll.
+    ///
+    /// A show (`MPSPPL…`) is read as its playlist (`VLPL…`): the same episodes, newest first, in
+    /// the playlist layout we parse, with exact lengths (the show page only has "34 min").
+    pub async fn podcast_episodes(&self, id: &str) -> anyhow::Result<TrackPage> {
+        let pl = id.strip_prefix("MPSP").unwrap_or(id).to_string();
+        let key = self.ckey("podcast", &pl).await;
+        cache::cached(&self.db, &key, PODCAST_TTL, false, || async move {
+            let v = self.post("browse", json!({ "browseId": format!("VL{pl}") }), true).await?;
+            Ok(track_page(&v))
+        })
+        .await
+    }
+
+    /// The next page of a podcast's episodes (one YouTube call), from the page before's token.
+    pub async fn episodes_more(&self, token: &str) -> anyhow::Result<TrackPage> {
+        let digest: String = Sha1::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let key = self.ckey("podcast-more", &digest).await;
+        cache::cached(&self.db, &key, PODCAST_TTL, false, || async move {
+            let v = self.post("browse", json!({ "continuation": token }), true).await?;
+            Ok(track_page(&v))
+        })
+        .await
+    }
+
+    /// A playlist's, album's or podcast's header (its name, for pages opened from a pasted link).
     pub async fn playlist_info(&self, id: &str) -> anyhow::Result<HeaderInfo> {
-        let browse_id = if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
-            id.to_string()
-        } else {
-            format!("VL{id}")
-        };
+        // A podcast's own page has the show's name and publisher.
+        let browse_id = if id.starts_with("MPSP") { id.to_string() } else { playlist_browse_id(id) };
         let key = self.ckey("playlist-info", id).await;
         cache::cached(&self.db, &key, 12 * cache::HOUR, false, || async move {
             let v = self.post("browse", json!({ "browseId": browse_id }), true).await?;
@@ -547,15 +605,25 @@ impl YtMusic {
         Ok(tracks)
     }
 
-    async fn fetch_home(&self) -> anyhow::Result<Vec<Shelf>> {
+    /// The first page plus one continuation, so the page is full on open (as before); the rest
+    /// loads as you scroll.
+    async fn fetch_home(&self) -> anyhow::Result<HomePage> {
         let v = self.post("browse", json!({ "browseId": "FEmusic_home" }), true).await?;
+        let visitor = v["responseContext"]["visitorData"].as_str().map(String::from);
+        let visitor = visitor.as_deref();
         let mut shelves = parse_shelves(&v);
-        if let Some(token) = find_continuation(&v) {
-            if let Ok(more) = self.post("browse", json!({ "continuation": token }), true).await {
-                shelves.extend(parse_shelves(&more));
+        let mut continuation = home_continuation(&v, visitor);
+        if let Some(token) = feed_continuation(&v) {
+            match self.post_continuation(&token, visitor).await {
+                Ok(more) => {
+                    shelves.extend(parse_shelves(&more));
+                    continuation = home_continuation(&more, visitor);
+                }
+                // Scrolling down retries it.
+                Err(e) => tracing::warn!("home feed page 2: {e:#}"),
             }
         }
-        Ok(shelves)
+        Ok(HomePage { shelves, continuation })
     }
 
     /// Tracks of a playlist ("PL..", "VL..", "RD..", "LM") or album ("MPRE..").
@@ -563,15 +631,11 @@ impl YtMusic {
         if id.starts_with("RD") {
             return self.fetch_watch_playlist(None, Some(id), limit).await;
         }
-        let browse_id = if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
-            id.to_string()
-        } else {
-            format!("VL{id}")
-        };
+        let browse_id = playlist_browse_id(id);
         let v = self.post("browse", json!({ "browseId": browse_id }), true).await?;
         let header = header_info(&v);
         let mut tracks = parse_responsive_items(&v);
-        let mut token = find_continuation(&v);
+        let mut token = list_continuation(&v);
         let mut pages = 0;
         while tracks.len() < limit && pages < 200 {
             let Some(t) = token.take() else { break };
@@ -581,7 +645,7 @@ impl YtMusic {
                 break;
             }
             tracks.extend(more);
-            token = find_continuation(&next);
+            token = list_continuation(&next);
             pages += 1;
         }
         // Album tracks don't carry artist/thumbnail per row: inherit from the header.
@@ -1305,6 +1369,65 @@ pub struct HeaderInfo {
     pub thumbnail: Option<String>,
 }
 
+/// A page of the home feed and the token for the next one (None at the end of the feed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomePage {
+    pub shelves: Vec<Shelf>,
+    /// Opaque to the client: `visitor|token`, since the token only works with the visitor id
+    /// of the session that got it.
+    pub continuation: Option<String>,
+}
+
+/// Podcasts get new episodes daily.
+const PODCAST_TTL: i64 = cache::HOUR;
+
+/// A page of a list of tracks (a podcast's episodes) and the token for the next one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackPage {
+    pub tracks: Vec<Track>,
+    pub continuation: Option<String>,
+}
+
+fn track_page(v: &Value) -> TrackPage {
+    let mut tracks = parse_responsive_items(v);
+    dedupe(&mut tracks);
+    TrackPage { tracks, continuation: list_continuation(v) }
+}
+
+/// The next-page token of a playlist's (or album's) track list. Not just the first token on the
+/// page: that can be the one for the suggestions under the list, which pages nothing in.
+fn list_continuation(v: &Value) -> Option<String> {
+    if let Some(c) = find_first(v, "continuationItemRenderer") {
+        if let Some(t) = c["continuationEndpoint"]["continuationCommand"]["token"].as_str() {
+            return Some(t.to_string());
+        }
+    }
+    ["musicPlaylistShelfRenderer", "musicPlaylistShelfContinuation", "musicShelfRenderer", "musicShelfContinuation"]
+        .into_iter()
+        .filter_map(|k| find_first(v, k))
+        .find_map(|s| s["continuations"][0]["nextContinuationData"]["continuation"].as_str().map(String::from))
+}
+
+/// The browse id of a playlist or album page.
+fn playlist_browse_id(id: &str) -> String {
+    if id.starts_with("VL") || id.starts_with("MPRE") || id.starts_with("FE") {
+        id.to_string()
+    } else {
+        format!("VL{id}")
+    }
+}
+
+fn home_continuation(v: &Value, visitor: Option<&str>) -> Option<String> {
+    feed_continuation(v).map(|t| format!("{}|{t}", visitor.unwrap_or_default()))
+}
+
+/// The feed's own next-page token (not one of a shelf inside it): on the first page it's on the
+/// section list, on later pages on the section list continuation.
+fn feed_continuation(v: &Value) -> Option<String> {
+    let list = find_first(v, "sectionListContinuation").or_else(|| find_first(v, "sectionListRenderer"))?;
+    list["continuations"][0]["nextContinuationData"]["continuation"].as_str().map(String::from)
+}
+
 fn header_info(v: &Value) -> HeaderInfo {
     for key in ["musicResponsiveHeaderRenderer", "musicDetailHeaderRenderer", "musicImmersiveHeaderRenderer"] {
         if let Some(h) = find_first(v, key) {
@@ -1336,6 +1459,13 @@ pub fn dedupe(tracks: &mut Vec<Track>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playlist_browse_ids() {
+        assert_eq!(playlist_browse_id("PLabc"), "VLPLabc");
+        assert_eq!(playlist_browse_id("MPREb_x"), "MPREb_x");
+        assert_eq!(playlist_browse_id("VLPLabc"), "VLPLabc");
+    }
 
     #[test]
     fn civil() {

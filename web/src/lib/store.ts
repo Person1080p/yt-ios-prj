@@ -21,6 +21,8 @@ type State = {
   nowPlayingOpen: boolean;
   menuTrack: Track | null;
   playlistPickerTracks: Track[] | null;
+  /** Song whose Plex version is being chosen (see PlexVersionSheet). */
+  plexMatchTrack: Track | null;
   toast: { id: number; text: string } | null;
   importTick: number;
 
@@ -28,6 +30,7 @@ type State = {
   toastMsg: (text: string) => void;
   openMenu: (t: Track | null) => void;
   pickPlaylist: (tracks: Track[] | null) => void;
+  choosePlexVersion: (t: Track | null) => void;
   setNowPlaying: (open: boolean) => void;
 };
 
@@ -46,6 +49,7 @@ export const useStore = create<State>((set, get) => ({
   nowPlayingOpen: false,
   menuTrack: null,
   playlistPickerTracks: null,
+  plexMatchTrack: null,
   toast: null,
   importTick: 0,
 
@@ -65,6 +69,7 @@ export const useStore = create<State>((set, get) => ({
   },
   openMenu: (t) => set({ menuTrack: t }),
   pickPlaylist: (tracks) => set({ playlistPickerTracks: tracks, menuTrack: null }),
+  choosePlexVersion: (t) => set({ plexMatchTrack: t, menuTrack: null }),
   setNowPlaying: (open) => set({ nowPlayingOpen: open }),
 }));
 

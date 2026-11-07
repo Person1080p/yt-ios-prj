@@ -141,6 +141,14 @@ impl Db {
         if !has_note {
             conn.execute_batch("ALTER TABLE import_jobs ADD COLUMN note TEXT;")?;
         }
+        // Migration: Plex matches you chose (kept as they are), and which matcher made the rest.
+        let has_manual: bool = conn.prepare("SELECT 1 FROM pragma_table_info('plex_matches') WHERE name='manual'")?.exists([])?;
+        if !has_manual {
+            conn.execute_batch(
+                "ALTER TABLE plex_matches ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE plex_matches ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         // Jobs that were running when the process died will never finish.
         conn.execute(
             "UPDATE import_jobs SET status='failed', error='server restarted', finished_at=?1 WHERE status='running'",

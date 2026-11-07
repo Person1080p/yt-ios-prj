@@ -36,6 +36,7 @@ pub fn router(state: SharedState) -> Router {
     let api = Router::new()
         // music
         .route("/home", get(music::home))
+        .route("/home/more", get(music::home_more))
         .route("/discover", get(music::discover))
         .route("/search", get(music::search))
         .route("/search/all", get(music::search_all))
@@ -45,6 +46,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/radio/{video_id}", get(music::radio))
         .route("/playlist/{id}", get(music::playlist))
         .route("/playlist/{id}/info", get(music::playlist_info))
+        .route("/podcast/{id}", get(music::podcast))
+        .route("/podcast/{id}/more", get(music::podcast_more))
         .route("/recommendations/{video_id}", get(music::recommendations))
         .route("/tracks/{video_id}", get(music::track))
         .route("/tracks/{video_id}/source", get(stream::source))
@@ -107,7 +110,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/plex/server", put(settings::plex_set_server))
         .route("/plex", delete(settings::plex_disconnect))
         .route("/plex/search", get(settings::plex_search))
-        .route("/plex/matches/{video_id}", put(settings::plex_set_match))
+        .route(
+            "/plex/matches/{video_id}",
+            get(settings::plex_get_match).put(settings::plex_set_match).delete(settings::plex_clear_match),
+        )
         .route("/plex/art", get(settings::plex_art))
         .route("/spotify", delete(settings::spotify_disconnect))
         .route("/profile", get(profile::get).put(profile::set))
